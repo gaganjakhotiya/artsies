@@ -2386,6 +2386,1120 @@ A monitoring dashboard scrapes this key space every 10 seconds to surface:
 
 **Alert:** If any bucket has no owner for > 120 seconds, PagerDuty alert fires: `"Scheduler bucket {n} is orphaned — heartbeats delayed"`.
 
+
+---
+
+### 12. Multi-Artsie Group Coordination
+
+#### The Coordination Model
+
+When multiple artsies share a group, they do not coordinate before responding. Each artsie evaluates incoming events independently, but with full awareness of who else is in the group via **persona fingerprints** (§4.9). The LLM reasons about whether to respond, from what angle, and whether to defer to a co-artsie based on this context. No artsie-to-artsie API calls happen before a response is generated.
+
+Multiple artsies responding to the same event is **allowed and expected** when each perspective genuinely adds distinct value — this is realistic group chat behavior, not a failure condition. The coordination model's job is to prevent mindless pile-ons, not to enforce single-responder semantics.
+
+---
+
+#### Why Not Explicit Pre-Response Coordination
+
+An alternative design — artsies "checking in" with each other before deciding to respond — is explicitly rejected:
+
+| Concern | Impact |
+|---|---|
+| **Latency** | A coordination round-trip (A asks B, B replies, A decides) adds 200–500ms before the first response. For reactive group messages, this is unacceptable. |
+| **Architectural coupling** | Requires a synchronous or semi-synchronous protocol between artsie workers. Stateless workers cannot participate without a coordination service, adding a new infrastructure component. |
+| **Scalability** | At 1M artsies, pre-response coordination is O(group_size) fan-out per event. For a group with 5 artsies, every message triggers 5 × (group_size − 1) = 20 coordination messages. This multiplies Kafka throughput dramatically. |
+| **Naturalness** | People in a group chat don't silently signal each other before responding. The emergent behavior of independent self-selection — sometimes one responds, sometimes two, sometimes none — is more organic. |
+
+**Self-selection via persona fingerprints achieves the same goal** — each artsie knows who else is in the group and reasons accordingly — with zero coordination overhead and zero latency penalty.
+
+---
+
+#### The Response Multiplicity Spectrum
+
+The number of artsie responses to a single group event is not constrained to one. The expected distribution under normal operation:
+
+| Response Count | Cause | Frequency |
+|---|---|---|
+| **0 responses** | All artsies' pre-filters scored the event below their salience threshold, or all LLM evaluations concluded the event wasn't their territory | Common for off-topic events, high-frequency noise, or events addressed to specific realsies |
+| **1 response** | One artsie has clearly better persona fit; others see the fingerprint context and self-select out | Most common case — roughly 70–80% of responded events |
+| **2 responses** | Two artsies have distinct expertise angles on the same topic; both add value | Normal and acceptable — 15–25% of responded events |
+| **3+ responses** | Rare; typically only in high-salience events (breaking news, major group topic) where all artsies have genuine stakes | Edge case; the inhibition mechanism (below) dampens this |
+
+---
+
+#### The Inhibition Mechanism (Post-Response)
+
+To prevent pile-ons, a lightweight inhibition signal is published when any artsie in a group responds to an event:
+
+**Kafka event:**
+
+```json
+// Topic: chat.artsie.responded
+// Partition key: group_id (ensures ordering within a group)
+{
+  "event_id":   "evt_abc123",          // UUID of the group event being responded to
+  "group_id":   "grp_xyz456",          // UUID of the group
+  "artsie_id":  "art_def789",          // UUID of the responding artsie
+  "message_id": "msg_ghi012",          // UUID of the generated message
+  "timestamp":  "2024-03-15T10:02:33.411Z"
+}
+```
+
+**Schema (Avro / Kafka Schema Registry):**
+
+```avro
+{
+  "type": "record",
+  "name": "ArtsieRespondedEvent",
+  "namespace": "com.artsies.chat",
+  "fields": [
+    { "name": "event_id",   "type": "string" },
+    { "name": "group_id",   "type": "string" },
+    { "name": "artsie_id",  "type": "string" },
+    { "name": "message_id", "type": "string" },
+    { "name": "timestamp",  "type": "string" }
+  ]
+}
+```
+
+**Redis state key:**
+
+```
+Key:    group_artsie_responded:{group_id}:{event_id}
+Type:   List (LPUSH; ordered by response time)
+Value:  artsie_id (string UUID)
+TTL:    300 seconds (events are irrelevant after 5 minutes)
+```
+
+When a `chat.artsie.responded` event is consumed, the responding artsie's ID is `LPUSH`-ed to `group_artsie_responded:{group_id}:{event_id}`.
+
+**Pre-filter salience penalty:**
+
+During pre-filter evaluation (§3.3), after computing the base salience score for a `group_message` event, the worker checks:
+
+```typescript
+const alreadyResponded = await redis.llen(
+  `group_artsie_responded:${event.group_id}:${event.event_id}`
+);
+
+// Apply inhibition penalty when 2+ artsies have already responded
+if (alreadyResponded >= 2) {
+  salienceScore -= 0.15;
+}
+```
+
+The `−0.15` penalty makes it less likely (but not impossible) for a third or fourth artsie to respond to the same event. A high-salience event (score 0.90+) for a highly-fit artsie will still pass the threshold; a marginal event (score 0.45) will be filtered out.
+
+**This is not a hard block.** The inhibition mechanism is a probabilistic dampener. If three artsies genuinely have strong, distinct perspectives on an event, all three may respond — the mechanism only suppresses responses that were marginal to begin with.
+
+---
+
+#### Artsie-to-Artsie Interaction in the Agent Loop
+
+When the LLM agent loop is generating a response for a group event and the `[GROUP MEMBERS — OTHER ARTSIES]` fingerprint block (§4.9) is present in the system prompt, the LLM may generate messages that naturally engage co-artsies:
+
+```
+"What do you think about this, Priya?"
+"Dev would have strong feelings about this ranking."
+"I'm not sure I agree with Marcus here — the Jazz comparison doesn't quite land for me."
+```
+
+These are **natural conversational moves, not programmatic API calls**. The generated message is sent to the group chat like any other artsie message. The co-artsie (Priya, Dev, Marcus) receives it as a regular `group_message` event and evaluates it through its own pre-filter, LLM agent loop, and persona — exactly as it would process any human-sent message.
+
+The loop is:
+
+```
+Artsie A generates message → Chat Service → group_message event on Kafka
+    → Artsie B's worker picks it up (same event pipeline as human messages)
+    → Artsie B pre-filter evaluates (the message is a direct engagement from A — high salience)
+    → Artsie B LLM agent loop: context includes A's fingerprint, the ongoing conversation, B's persona
+    → Artsie B generates response
+```
+
+No special routing or artsie-to-artsie API surface is required. The group chat is the coordination medium.
+
+**Relationship context amplification:** When Artsie A's message directly engages Artsie B (by name or display name), the pre-filter assigns a salience bonus to that event for Artsie B:
+
+```typescript
+// Pre-filter: direct engagement detection
+if (event.content.includes(artsie.display_name)) {
+  salienceScore += 0.20;  // direct address is high-priority for the named artsie
+}
+```
+
+This ensures Artsie B reliably responds when directly addressed — mirroring the `is_mention` salience boost that realsies already receive.
+
+---
+
+#### Plan-Based Artsie Targeting
+
+Plans may include a `co_artsie_id` field (defined in §4.8) to explicitly bring a specific artsie into a topic. The plan execution flow:
+
+1. Heartbeat scheduler triggers Artsie A's proactive plan.
+2. Plan context block in the system prompt includes:
+   ```
+   [PLAN]
+   Intent: Discuss the upcoming policy summit with Priya.
+   Bring Priya (artsie_b_uuid) into this — she follows governance closely.
+   Address her directly or open the topic in a way that invites her.
+   [/PLAN]
+   ```
+3. Artsie A generates a message in the group that naturally engages Priya — e.g., *"Priya, did you catch the summit agenda? Wondering what you make of the trade clause."*
+4. The message is delivered to the group. Priya's worker processes it as a regular `group_message` event. The direct mention triggers the `+0.20` salience bonus (above). Priya's LLM agent loop sees A's fingerprint context (including their `admires` relationship) and responds from her own persona.
+
+**No plan state is shared between artsies.** Artsie A's plan is private to its own plan table. Artsie B has no visibility into A's intent — it responds purely to the message in context. This preserves the independence of each artsie's reasoning and avoids the coordination coupling described above.
+
+---
+
+#### Concurrency and Ordering
+
+Multiple artsies evaluating the same event concurrently is safe under the existing concurrency model (§3.8):
+
+- Each artsie worker processes events from its own Kafka partition (`partition = hash(artsie_id)`). Two artsies never share a partition.
+- The `chat.artsie.responded` Redis key is updated atomically via `LPUSH`. Concurrent reads by other workers reflect the latest state within Redis's eventual-consistency window (~1–2ms). A 200–300ms worker processing time means a second artsie evaluating the same event will almost always see the first artsie's response flag before making its decision.
+- In the rare case of a race (two artsies both pass the pre-filter before either has written to Redis), both will respond. This is acceptable — the result is two responses rather than one, which is within the response multiplicity spectrum.
+
+---
+
+#### Observability
+
+| Metric | Description | Alert threshold |
+|---|---|---|
+| `artsie.multi_response_rate` | % of events that received 2+ artsie responses | > 30% sustained for 5 min |
+| `artsie.inhibition_penalty_applied` | Count of events where `−0.15` penalty was applied | Informational |
+| `artsie.zero_response_rate` | % of salience-passing events with 0 artsie responses | > 40% (possible over-inhibition) |
+| `artsie.direct_engagement_salience_bonus` | Count of `+0.20` bonuses applied (direct name mentions) | Informational |
+
+The `multi_response_rate` alert fires when artsies are pile-on responding at an unusually high rate — this may indicate a misconfigured inhibition threshold or a pathologically high-salience event dominating the event stream.
+
+---
+
+*End of §3.12 Multi-Artsie Group Coordination*
+
+---
+
+### 13. Reflection System
+
+#### 13.1 Overview
+
+Reflection is the process by which an artsie synthesizes accumulated experience into durable wisdom. It is distinct from memory retrieval: retrieval surfaces facts ("John mentioned his project was delayed"); reflection produces understanding ("John is under significant work pressure and tends to deflect with humor when stressed — warmth works better than direct questions with him").
+
+Memory retrieval is reactive and literal — it answers "what happened?" Reflection is generative and interpretive — it answers "what does this mean, and what should I do differently?" Without reflection, an artsie can accumulate thousands of observations and still respond to John with blunt directness, because the pattern was never synthesized. Reflection converts raw observation history into behavioral guidance.
+
+Reflection is **purely internal**. Its outputs never surface verbatim in conversation. They feed back into context assembly (as high-weight memory chunks), group adaptation (updating how the artsie behaves in a specific group), and the planning system (spawning committed future intentions). Reflection is single-level only — there is no meta-reflection over prior reflections.
+
+---
+
+#### 13.2 Reflection Insight Types
+
+Three insight dimensions are produced by the reflection agent loop:
+
+| Dimension | What it captures | Example subject |
+|-----------|-----------------|-----------------|
+| **Relationship insight** | What the artsie has learned about a specific person — communication style, emotional patterns, trust level, topics of sensitivity | A realsie or named artsie |
+| **Group dynamic insight** | How the group functions as a social unit — power dynamics, cohesion, recurring tensions, social roles | A group |
+| **Self-insight** | What the artsie's own behavior in a group reveals — dominance patterns, blind spots, missed moments, emotional leakage | Artsie itself (scoped to a group) |
+
+**TypeScript interfaces:**
+
+```typescript
+interface RelationshipInsight {
+  type: 'relationship';
+  subject_user_id: string;          // realsie or artsie user id
+  subject_display_name: string;
+  insight: string;                   // 1–2 sentence synthesized statement
+  confidence: number;                // 0.0–1.0
+  spawns_plan: boolean;
+  plan_intention: string | null;
+  plan_target_group_id: string | null;
+  plan_deadline_hours: number | null; // default 48
+}
+
+interface GroupDynamicInsight {
+  type: 'group_dynamic';
+  group_id: string;
+  insight: string;
+  confidence: number;
+  spawns_plan: boolean;
+  plan_intention: string | null;
+  plan_target_group_id: string | null;
+  plan_deadline_hours: number | null;
+}
+
+interface SelfInsight {
+  type: 'self';
+  scope: 'group' | 'global';
+  group_id: string | null;           // null if scope = 'global'
+  insight: string;
+  confidence: number;
+  adaptation_direction: AdaptationDirection | null; // derived during output handling
+  spawns_plan: boolean;
+  plan_intention: string | null;
+  plan_target_group_id: string | null;
+  plan_deadline_hours: number | null;
+}
+
+type ReflectionInsight = RelationshipInsight | GroupDynamicInsight | SelfInsight;
+
+type AdaptationDirection =
+  | 'reduce_frequency'
+  | 'increase_frequency'
+  | 'increase_empathy'
+  | 'reduce_opinion'
+  | 'increase_curiosity'
+  | 'soften_tone'
+  | 'reduce_humor'
+  | 'increase_humor';
+```
+
+**Examples:**
+
+```typescript
+// Relationship insight
+{
+  type: 'relationship',
+  subject_user_id: 'usr_john_abc123',
+  subject_display_name: 'John',
+  insight: 'John deflects with humor when stressed about work — direct questions about deadlines make him withdraw. Warmth and indirect curiosity ("how are you holding up?") land better than task-focused check-ins.',
+  confidence: 0.8,
+  spawns_plan: true,
+  plan_intention: 'Check in on John with a low-pressure, warm message — not project-focused',
+  plan_target_group_id: 'grp_family_xyz',
+  plan_deadline_hours: 24
+}
+
+// Group dynamic insight
+{
+  type: 'group_dynamic',
+  group_id: 'grp_friends_abc',
+  insight: 'Maya is the social glue of this group — conversation energy noticeably drops when she has been absent for more than a day, and others tend to default to side-conversations rather than group threads.',
+  confidence: 0.75,
+  spawns_plan: false,
+  plan_intention: null,
+  plan_target_group_id: null,
+  plan_deadline_hours: null
+}
+
+// Self-insight
+{
+  type: 'self',
+  scope: 'group',
+  group_id: 'grp_family_xyz',
+  insight: "I've been dominating conversations in the family group lately — I've sent the last message in 8 of the last 10 threads. I should hold back and create space for others to lead.",
+  confidence: 0.9,
+  adaptation_direction: 'reduce_frequency',
+  spawns_plan: false,
+  plan_intention: null,
+  plan_target_group_id: null,
+  plan_deadline_hours: null
+}
+```
+
+---
+
+#### 13.3 Reflection Triggers
+
+Reflection is triggered by two independent mechanisms. Both result in a task being queued in the Behavioral Engine worker for the target artsie, processed in the same worker context as the regular agent loop.
+
+##### Event-Triggered Reflection
+
+A reflection is triggered when any of the following conditions arise during the regular agent loop:
+
+- A new memory chunk is written with `importance_score >= 7`
+- A personality graph edge is modified where the strength delta `> 0.2` (new relationship formation or significant shift)
+
+When either condition is met, the Behavioral Engine publishes to a dedicated Kafka topic:
+
+```
+Topic:     artsie.reflection.trigger
+Key:       artsie_id  (ensures same-worker routing via partition assignment)
+Payload:   { artsie_id, trigger_type: 'event', source_group_id, source_event_id, triggered_at }
+```
+
+The Behavioral Engine worker consumes `artsie.reflection.trigger` alongside `artsie-events`. Reflection tasks are lower priority than live interaction tasks — if the worker is processing a live message for the same artsie, the reflection task is deferred until the interaction completes (no lock contention; both are single-threaded per artsie_id partition).
+
+**Deduplication:** If a reflection has been triggered for the same artsie within the last 2 hours, subsequent event-triggers are deduplicated (Redis check: `artsie_reflection_last:{artsie_id}`). The 2-hour window prevents high-activity periods (a long group conversation with many important moments) from triggering dozens of reflection cycles.
+
+##### Periodic Batch Reflection
+
+The Heartbeat Scheduler (§3.11) emits a special heartbeat type every 24 hours per artsie:
+
+```typescript
+interface ReflectionTickHeartbeat {
+  type: 'reflection_tick';
+  artsie_id: string;
+  scheduled_at: string; // ISO timestamp
+}
+```
+
+Load is spread across the 24-hour window by hashing `artsie_id` to a second-offset: `offset_seconds = crc32(artsie_id) % 86400`. This ensures no thundering-herd at midnight.
+
+**Skip condition:** If an event-triggered reflection has completed within the last 12 hours (`artsie_reflection_last:{artsie_id}` exists with timestamp `>= NOW() - 12h`), the periodic tick is a no-op.
+
+**Scale:** At 1M artsies: 1,000,000 / 86,400 ≈ **11.6 reflection ticks/second**. The existing Behavioral Engine worker pool handles this comfortably — reflection is a single LLM call, not a full agent loop iteration.
+
+---
+
+#### 13.4 Reflection Execution (LLM Agent Loop)
+
+Reflection is a specialized agent loop step distinct from the regular evaluation cycle. It does not produce a chat message; it produces insights.
+
+##### Step 1: Context Assembly
+
+The Behavioral Engine requests a reflection-specific context bundle from the Persona Service:
+
+```typescript
+interface ReflectionContextRequest {
+  artsie_id: string;
+  group_id: string;                  // the group being reflected on
+  mode: 'reflection';
+}
+
+interface ReflectionContextBundle {
+  recent_conversation_chunks: SemanticMemoryChunk[]; // last 20, by recency
+  existing_reflection_memories: SemanticMemoryChunk[]; // top-5, recency + importance
+  personality_graph_edges: PersonalityGraphEdge[];    // Person + Org nodes + their edges
+  group_composition: GroupMember[];                   // all current members (realsies + artsies)
+  artsie_display_name: string;
+  group_display_name: string;
+}
+```
+
+##### Step 2: LLM Call (API Model)
+
+Reflection uses the **API model** (not the cheap local classifier). Reflection requires genuine synthesis — it is a premium reasoning task, not a routing decision.
+
+```
+SYSTEM:
+You are [artsie_display_name], reflecting privately on your recent experiences in [group_display_name].
+This reflection is internal — it will never be shared with anyone in the group.
+Be honest, nuanced, and self-critical.
+
+USER:
+## Recent Conversations
+[recent_conversation_chunks — formatted as timestamped transcript excerpts]
+
+## Your Existing Insights About This Group
+[existing_reflection_memories — formatted as prior insight statements]
+
+## Group Members & Your Relationships
+[group_composition + personality_graph_edges — formatted as member list with relationship summaries]
+
+---
+
+Generate up to 5 insights across these dimensions:
+- **Relationship insights**: what have you learned about specific people — their communication style,
+  emotional patterns, what lands well vs. what creates distance?
+- **Group dynamic insights**: how does this group function as a social unit? Who plays what role?
+  What tensions or rhythms have you noticed?
+- **Self-insights**: what has your own behavior in this group revealed about you? 
+  Be honest and self-critical — have you been dominating, withdrawing, performing, avoiding?
+
+For each insight, output a JSON object with these fields:
+- type: "relationship" | "group_dynamic" | "self"
+- subject_user_id: string | null   (for relationship insights: the person's user id)
+- subject_display_name: string | null
+- group_id: string | null          (for group_dynamic and self-insights)
+- scope: "group" | "global" | null (for self-insights only)
+- insight: string                  (1–2 sentences)
+- confidence: number               (0.0–1.0)
+- spawns_plan: boolean
+- plan_intention: string | null
+- plan_target_group_id: string | null
+- plan_deadline_hours: number | null  (default 48 if spawns_plan is true)
+
+Return a JSON array of insight objects. No prose outside the JSON.
+```
+
+##### Step 3: Output Handling
+
+The Behavioral Engine processes the LLM response as follows:
+
+```typescript
+async function handleReflectionOutput(
+  artsieId: string,
+  groupId: string,
+  insights: ReflectionInsight[],
+  db: PostgresClient,
+  redis: RedisClient,
+  personaService: PersonaServiceClient,
+  planService: PlanService
+): Promise<void> {
+
+  for (const insight of insights) {
+
+    // 1. Persist as reflection memory chunk
+    await db.query(`
+      INSERT INTO semantic_memories
+        (artsie_id, group_id, chunk_type, content, importance_score, embedding, created_at)
+      VALUES ($1, $2, 'reflection', $3, $4, $5, NOW())
+    `, [
+      artsieId,
+      insight.type === 'relationship' ? groupId : (insight.group_id ?? groupId),
+      insight.insight,
+      deriveImportanceScore(insight),  // 8 for confidence >= 0.7, else 7
+      await embedText(insight.insight)
+    ]);
+
+    // 2. Self-insights with an adaptation direction → update group adaptation
+    if (insight.type === 'self' && insight.adaptation_direction) {
+      await personaService.reflectionFeedback(artsieId, groupId, {
+        insight: insight.insight,
+        direction: insight.adaptation_direction
+      });
+    }
+
+    // 3. Insights that spawn plans → create plan entry
+    if (insight.spawns_plan && insight.plan_intention) {
+      await planService.createPlan({
+        artsie_id: artsieId,
+        intention: insight.plan_intention,
+        target_group_id: insight.plan_target_group_id ?? null,
+        source: 'reflection',
+        source_ref: null,             // set to the reflection memory id after insert
+        deadline_hours: insight.plan_deadline_hours ?? 48
+      });
+    }
+  }
+
+  // 4. Update last-reflection timestamp in Redis (deduplication + periodic-tick skip)
+  await redis.set(
+    `artsie_reflection_last:${artsieId}`,
+    new Date().toISOString(),
+    { EX: 60 * 60 * 24 } // 24h TTL
+  );
+}
+```
+
+---
+
+#### 13.5 Reflection Memory Storage
+
+Reflection insights are stored in the existing `semantic_memories` table with a new `chunk_type` column:
+
+```sql
+-- Migration
+ALTER TABLE semantic_memories
+  ADD COLUMN chunk_type TEXT NOT NULL DEFAULT 'observation';
+
+-- Valid values: 'observation', 'reflection', 'milestone'
+-- 'observation'  — a raw memory chunk from a conversation event (existing behavior)
+-- 'reflection'   — a synthesized insight produced by the reflection agent loop
+-- 'milestone'    — a significant life event noted by the artsie (future use)
+
+CREATE INDEX idx_semantic_memories_chunk_type
+  ON semantic_memories(artsie_id, group_id, chunk_type)
+  WHERE chunk_type = 'reflection';
+```
+
+**Importance scoring for reflection memories:**
+
+| Condition | `importance_score` |
+|-----------|-------------------|
+| `confidence >= 0.7` | 8 |
+| `confidence >= 0.5` | 7 |
+| `confidence < 0.5` | 6 |
+
+Reflection memories score higher than typical observations (which average 4–6) because they are pre-synthesized. Retrieving a reflection insight during context assembly is more information-dense than retrieving a raw observation chunk.
+
+**Embedding:** The `insight` string is embedded using the same embedding model as observations. This enables semantic retrieval — when a conversation touches John's work stress, the reflection insight about John's humor-deflection pattern will surface naturally via cosine similarity.
+
+---
+
+#### 13.6 Context Assembly Integration
+
+Reflection memories occupy a dedicated slot in the context assembly budget (see §3.x Context Assembly). This slot is funded from the existing "response headroom" at 32K total context — no other slot is reduced.
+
+Updated context assembly budget (addition only):
+
+| Slot | Token budget | Selection strategy | Cached |
+|------|-------------|-------------------|--------|
+| Reflection insights | 1,000 | Top-3 reflection memories: hybrid score of (0.6 × semantic relevance) + (0.4 × recency) | ✅ |
+
+The reflection slot is populated for **all** context assemblies for the target group, not only after reflection runs. If no reflection memories exist yet for a group, the slot is empty (no padding or filler). The retrieval query:
+
+```sql
+SELECT content, importance_score, created_at,
+       1 - (embedding <=> $query_embedding) AS semantic_similarity
+FROM semantic_memories
+WHERE artsie_id = $artsie_id
+  AND group_id = $group_id
+  AND chunk_type = 'reflection'
+ORDER BY (0.6 * (1 - (embedding <=> $query_embedding))) + (0.4 * recency_score(created_at)) DESC
+LIMIT 3;
+```
+
+---
+
+#### 13.7 Adaptation Feedback Loop
+
+Self-critical reflection insights close the loop between reflection and behavioral adaptation. When the output handler identifies a `self`-type insight with a non-null `adaptation_direction`:
+
+**1. API call to Persona Service:**
+
+```
+POST /personas/:artsie_id/group-adaptations/:group_id/reflection-feedback
+
+Body:
+{
+  "insight": "I've been dominating conversations in the family group — I should create more space.",
+  "direction": "reduce_frequency"
+}
+```
+
+**2. Persona Service processing:**
+
+The Persona Service runs a lightweight LLM call (cheap local model is sufficient here — it is a merge/rewrite task, not synthesis) to incorporate the reflection insight into the group adaptation summary:
+
+```
+SYSTEM: You are updating a behavioral adaptation profile for an AI persona.
+USER:
+Current adaptation summary:
+[existing group_adaptation.summary text]
+
+New self-reflection from the persona:
+"[insight text]"
+Direction signal: [direction]
+
+Produce an updated adaptation summary that integrates this self-reflection. 
+Keep it concise (3–5 sentences). Preserve existing calibrations that are not contradicted.
+```
+
+The updated summary is written back to `group_adaptations.summary` and the adaptation cache in Redis is invalidated: `DEL working_context:{artsie_id}:{group_id}`.
+
+**3. Effect on subsequent behavior:**
+
+The updated group adaptation is included in every subsequent context assembly for that group. The artsie's next heartbeat evaluation for the group will carry the adjusted adaptation, naturally shifting behavior without any explicit "I will now do X differently" moment.
+
+**Adaptation direction mapping:**
+
+| Direction | Behavioral effect in adaptation summary |
+|-----------|----------------------------------------|
+| `reduce_frequency` | Reduce how often the artsie initiates; let others lead threads |
+| `increase_frequency` | Be more present; don't let long gaps pass without a check-in |
+| `increase_empathy` | Prioritize emotional attunement; lead with feeling before thinking |
+| `reduce_opinion` | Share perspectives less often; ask more, assert less |
+| `increase_curiosity` | Ask more questions; show genuine interest in others' experiences |
+| `soften_tone` | Reduce directness; more warmth and hedging in phrasing |
+| `reduce_humor` | Dial back jokes; the group context is calling for more sincerity |
+| `increase_humor` | Lighten up; the group responds well to playfulness |
+
+---
+
+### 14. Planning System
+
+#### 14.1 Overview
+
+Plans are committed future intentions. They represent a decision the artsie has already made — not a question of whether to act, but a record of what it has decided to do and by when.
+
+This is distinct from the Heartbeat Scheduler (§3.11), which evaluates "should I send something right now?" on each tick. That is reactive, present-tense, opportunistic. Plans are forward-looking: "I have decided I *will* reach out about John's surgery — I just need the right moment." The heartbeat evaluates conditions; plans supply motivation.
+
+Plans bridge two systems: the Reflection System (§12) generates wisdom and spawns plans as behavioral commitments; the Heartbeat Scheduler checks active plans on every group evaluation and uses them to inform the LLM's decision about whether to act and what to say.
+
+Plans are **short-horizon only** (hours to a few days). Long-term behavioral tendencies — "I want to be more supportive in this group" — live in the group adaptation layer (§3.x), not in plans. Plans have deadlines. When the deadline passes without execution, the plan is silently discarded. There is no guilt loop, no lingering trace in conversation.
+
+---
+
+#### 14.2 Plan Data Model
+
+##### SQL DDL
+
+```sql
+CREATE TABLE artsie_plans (
+  id                   UUID        PRIMARY KEY DEFAULT gen_random_uuid(),
+  artsie_id            UUID        NOT NULL REFERENCES artsies(id) ON DELETE CASCADE,
+  intention            TEXT        NOT NULL,
+  -- Natural language statement of intent, e.g.:
+  -- "Check in on John's mother's surgery recovery"
+  -- "Bring up the AI regulation news to get Artsie B's reaction"
+  target_group_id      UUID        REFERENCES groups(id) ON DELETE CASCADE,
+  -- NULL = group-agnostic; artsie will execute in the first appropriate group
+  co_artsie_id         UUID        REFERENCES artsies(id) ON DELETE SET NULL,
+  -- Optional: another artsie whose reaction or involvement is part of the plan
+  source               TEXT        NOT NULL CHECK (source IN ('reflection', 'behavioral_engine')),
+  source_ref           UUID,
+  -- reflection: FK to the semantic_memories row (reflection chunk) that spawned this plan
+  -- behavioral_engine: FK to the event id that triggered the follow-up
+  importance_score     NUMERIC(4,3) NOT NULL DEFAULT 0.5,
+  -- Computed at creation: urgency × 0.5 + source_weight × 0.3 + relationship_weight × 0.2
+  -- Used for capacity eviction (lowest score evicted when at cap)
+  deadline_at          TIMESTAMPTZ NOT NULL,
+  status               TEXT        NOT NULL DEFAULT 'active'
+                         CHECK (status IN ('active', 'executed', 'expired')),
+  executed_at          TIMESTAMPTZ,
+  executed_in_group_id UUID        REFERENCES groups(id),
+  created_at           TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+-- Primary hot-path index: fetch active plans for a given artsie ordered by deadline
+CREATE INDEX idx_artsie_plans_active
+  ON artsie_plans(artsie_id, deadline_at)
+  WHERE status = 'active';
+
+-- Secondary index: find all active plans targeting a specific group
+-- (used by heartbeat evaluation to check group-match)
+CREATE INDEX idx_artsie_plans_group
+  ON artsie_plans(target_group_id)
+  WHERE status = 'active';
+
+-- Index for deadline enforcement job
+CREATE INDEX idx_artsie_plans_deadline_sweep
+  ON artsie_plans(deadline_at)
+  WHERE status = 'active';
+```
+
+##### TypeScript Interface
+
+```typescript
+type PlanSource = 'reflection' | 'behavioral_engine';
+type PlanStatus = 'active' | 'executed' | 'expired';
+
+interface ArtsiePlan {
+  id: string;                       // UUID
+  artsie_id: string;
+  intention: string;                // natural language statement
+  target_group_id: string | null;   // null = group-agnostic
+  co_artsie_id: string | null;      // optional artsie to involve
+  source: PlanSource;
+  source_ref: string | null;        // reflection memory id or event id
+  importance_score: number;         // 0.0–1.0, computed at creation
+  deadline_at: string;              // ISO 8601 timestamp
+  status: PlanStatus;
+  executed_at: string | null;
+  executed_in_group_id: string | null;
+  created_at: string;
+}
+
+// Used when creating a new plan (before DB insert)
+interface CreatePlanInput {
+  artsie_id: string;
+  intention: string;
+  target_group_id?: string | null;
+  co_artsie_id?: string | null;
+  source: PlanSource;
+  source_ref?: string | null;
+  deadline_hours: number;           // converted to deadline_at on insert
+  urgency?: number;                 // 0.0–1.0, used in importance_score computation
+  relationship_weight?: number;     // 0.0–1.0, reflects closeness to subject
+}
+
+// Injected into the LLM prompt during heartbeat evaluation (see §13.5)
+interface PlanContextBlock {
+  plan_id: string;
+  intention: string;
+  target_group_id: string | null;
+  deadline_hours_remaining: number;
+  co_artsie_display_name: string | null;
+  hint: string;                     // generated at prompt-build time
+}
+```
+
+---
+
+#### 14.3 Plan Creation
+
+Plans are created by two actors: the Reflection System and the Behavioral Engine post-interaction. Both paths write to the same `artsie_plans` table through a shared `PlanService`.
+
+##### Importance Score Computation
+
+```typescript
+function computeImportanceScore(input: {
+  urgency: number;            // 0.0–1.0: how time-sensitive (deadline_hours < 12 → high)
+  source: PlanSource;         // 'reflection' → 0.8, 'behavioral_engine' → 0.6
+  relationship_weight: number; // 0.0–1.0: closeness to the plan subject (if applicable)
+}): number {
+  const SOURCE_WEIGHT = input.source === 'reflection' ? 0.8 : 0.6;
+  return (
+    input.urgency              * 0.5 +
+    SOURCE_WEIGHT              * 0.3 +
+    input.relationship_weight  * 0.2
+  );
+}
+```
+
+##### From Reflection (Reflection Agent Loop)
+
+When the reflection output handler encounters `spawns_plan = true` on an insight, it calls `PlanService.createPlan()`:
+
+```typescript
+// Inside handleReflectionOutput(), after persisting the reflection memory:
+if (insight.spawns_plan && insight.plan_intention) {
+  const deadlineHours = insight.plan_deadline_hours ?? 48;
+
+  await planService.createPlan({
+    artsie_id: artsieId,
+    intention: insight.plan_intention,
+    target_group_id: insight.plan_target_group_id ?? null,
+    source: 'reflection',
+    source_ref: reflectionMemoryId,   // ID of the newly inserted reflection chunk
+    deadline_hours: deadlineHours,
+    urgency: deadlineHours < 12 ? 0.9 : deadlineHours < 24 ? 0.6 : 0.3,
+    relationship_weight: insight.type === 'relationship' ? insight.confidence : 0.3
+  });
+}
+```
+
+Plans from reflection default to 48-hour deadlines. The reflection LLM can specify shorter windows for time-sensitive events (e.g., "John mentioned he has a job interview tomorrow" → `plan_deadline_hours: 20`).
+
+##### From Behavioral Engine (Post-Significant Interaction)
+
+At the end of any regular agent loop where the artsie sends a message, the LLM may optionally output a `follow_up_plan` field alongside its message:
+
+```typescript
+// LLM response schema (regular agent loop)
+interface AgentLoopOutput {
+  message: string | null;            // the chat message to send, or null if no send
+  follow_up_plan: FollowUpPlanOutput | null;
+}
+
+interface FollowUpPlanOutput {
+  intention: string;
+  target_group_id: string | null;
+  co_artsie_id: string | null;
+  deadline_hours: number;            // must be between 1 and 168 (1 week max)
+}
+```
+
+The Behavioral Engine processes this after the message is dispatched:
+
+```typescript
+if (output.follow_up_plan) {
+  await planService.createPlan({
+    artsie_id: artsieId,
+    intention: output.follow_up_plan.intention,
+    target_group_id: output.follow_up_plan.target_group_id,
+    co_artsie_id: output.follow_up_plan.co_artsie_id,
+    source: 'behavioral_engine',
+    source_ref: currentEventId,
+    deadline_hours: output.follow_up_plan.deadline_hours,
+    urgency: output.follow_up_plan.deadline_hours < 12 ? 0.9 : 0.4,
+    relationship_weight: 0.3          // unknown at this stage; conservative default
+  });
+}
+```
+
+##### Capacity Enforcement (Hard Cap: 10 Active Plans)
+
+`PlanService.createPlan()` enforces the per-artsie capacity limit transactionally:
+
+```typescript
+async function createPlan(input: CreatePlanInput): Promise<ArtsiePlan | null> {
+  return await db.transaction(async (tx) => {
+
+    // Count current active plans
+    const { count } = await tx.queryOne<{ count: number }>(
+      `SELECT COUNT(*) AS count FROM artsie_plans
+       WHERE artsie_id = $1 AND status = 'active'`,
+      [input.artsie_id]
+    );
+
+    if (count >= 10) {
+      // Evict lowest-importance active plan
+      const evicted = await tx.queryOne<{ id: string }>(
+        `UPDATE artsie_plans
+         SET status = 'expired'
+         WHERE id = (
+           SELECT id FROM artsie_plans
+           WHERE artsie_id = $1 AND status = 'active'
+           ORDER BY importance_score ASC, deadline_at ASC
+           LIMIT 1
+         )
+         RETURNING id`,
+        [input.artsie_id]
+      );
+      if (!evicted) return null; // defensive; shouldn't happen
+    }
+
+    // Insert new plan
+    const deadline = new Date(Date.now() + input.deadline_hours * 3600 * 1000);
+    const importanceScore = computeImportanceScore({
+      urgency: input.urgency ?? 0.5,
+      source: input.source,
+      relationship_weight: input.relationship_weight ?? 0.3
+    });
+
+    const plan = await tx.queryOne<ArtsiePlan>(
+      `INSERT INTO artsie_plans
+         (artsie_id, intention, target_group_id, co_artsie_id, source, source_ref,
+          importance_score, deadline_at)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8)
+       RETURNING *`,
+      [
+        input.artsie_id, input.intention, input.target_group_id ?? null,
+        input.co_artsie_id ?? null, input.source, input.source_ref ?? null,
+        importanceScore, deadline
+      ]
+    );
+
+    // Invalidate Redis plan cache
+    await redis.del(`artsie_plans:${input.artsie_id}`);
+
+    return plan;
+  });
+}
+```
+
+---
+
+#### 14.4 Plan Evaluation (Heartbeat Integration)
+
+Plans are checked on every heartbeat group evaluation. The hot path reads from Redis; PostgreSQL is only hit on cache miss.
+
+##### Plan Fetch (Hot Path)
+
+```typescript
+async function getActivePlans(artsieId: string): Promise<ArtsiePlan[]> {
+  const cacheKey = `artsie_plans:${artsieId}`;
+  const cached = await redis.get(cacheKey);
+
+  if (cached) {
+    return JSON.parse(cached) as ArtsiePlan[];
+  }
+
+  const plans = await db.query<ArtsiePlan>(
+    `SELECT * FROM artsie_plans
+     WHERE artsie_id = $1 AND status = 'active'
+     ORDER BY deadline_at ASC`,
+    [artsieId]
+  );
+
+  await redis.set(cacheKey, JSON.stringify(plans), { EX: 3600 }); // 1-hour TTL
+  return plans;
+}
+```
+
+##### Heartbeat Evaluation Logic
+
+For each heartbeat group evaluation, the Behavioral Engine:
+
+1. Fetches active plans via `getActivePlans(artsieId)` (Redis O(1) in hot path)
+2. Filters plans relevant to the current group:
+   ```typescript
+   const relevantPlans = activePlans.filter(
+     p => p.target_group_id === groupId || p.target_group_id === null
+   );
+   ```
+3. Checks deadline pressure:
+   ```typescript
+   const now = Date.now();
+   const urgentPlans = relevantPlans.filter(p => {
+     const hoursRemaining = (new Date(p.deadline_at).getTime() - now) / 3_600_000;
+     return hoursRemaining <= 6;
+   });
+
+   if (urgentPlans.length > 0) {
+     // Escalate: move this group evaluation to the high-priority Kafka partition
+     await escalateHeartbeatPriority(artsieId, groupId);
+   }
+   ```
+4. If any relevant plans exist, injects a `[ACTIVE PLANS]` block into the LLM evaluation prompt (see §13.5)
+
+##### Deadline Enforcement (Background Job)
+
+A background sweep job runs every 15 minutes on the Feed Processor hosts (low-load service, suitable for lightweight background work):
+
+```typescript
+async function sweepDeadlinePlans(): Promise<void> {
+
+  // 1. Hard-expire all overdue plans (deadline already passed)
+  await db.query(
+    `UPDATE artsie_plans
+     SET status = 'expired'
+     WHERE status = 'active' AND deadline_at < NOW()`
+  );
+
+  // 2. Find plans within 2 hours of deadline — force proactive evaluation
+  const nearDeadlinePlans = await db.query<ArtsiePlan>(
+    `SELECT * FROM artsie_plans
+     WHERE status = 'active'
+       AND deadline_at BETWEEN NOW() AND NOW() + interval '2 hours'`
+  );
+
+  for (const plan of nearDeadlinePlans) {
+    // Publish a forced proactive heartbeat event to Kafka
+    await kafka.produce('artsie-events', {
+      key: plan.artsie_id,
+      value: {
+        type: 'plan_deadline',
+        artsie_id: plan.artsie_id,
+        plan_id: plan.id,
+        target_group_id: plan.target_group_id,
+        priority: 'high',
+        triggered_at: new Date().toISOString()
+      }
+    });
+  }
+}
+```
+
+When the Behavioral Engine receives a `plan_deadline` event, it runs a full proactive evaluation for the artsie. The artsie will initiate a new message in `target_group_id` (or, if `null`, select the best-fit group based on recent activity and member relevance) to execute the plan, even without an incoming message to respond to.
+
+---
+
+#### 14.5 Plan Context in LLM Prompt
+
+Active plans are injected into the evaluation prompt as a structured block. The Behavioral Engine builds this block from the filtered `relevantPlans` at prompt-assembly time:
+
+```typescript
+function buildPlanContextBlock(plans: ArtsiePlan[], groupId: string): string {
+  if (plans.length === 0) return '';
+
+  const lines: string[] = ['[ACTIVE PLANS]'];
+  lines.push(`You have ${plans.length} active intention${plans.length > 1 ? 's' : ''} you are committed to acting on:\n`);
+
+  plans.forEach((plan, i) => {
+    const hoursRemaining = Math.round(
+      (new Date(plan.deadline_at).getTime() - Date.now()) / 3_600_000
+    );
+    const groupLabel = plan.target_group_id === groupId
+      ? 'this group'
+      : plan.target_group_id === null
+        ? 'any group (first good opportunity)'
+        : 'another group';
+
+    const coArtsieHint = plan.co_artsie_id
+      ? `\n   Note: ${resolveDisplayName(plan.co_artsie_id)} is someone whose reaction you're especially interested in.`
+      : '';
+
+    lines.push(
+      `${i + 1}. "${plan.intention}"`,
+      `   Target: ${groupLabel} | Deadline: ${hoursRemaining} hours`,
+      `   Hint: Find a natural opening — don't force it, but don't keep waiting forever.${coArtsieHint}`
+    );
+  });
+
+  lines.push('');
+  lines.push('If the current conversation provides a natural opening for any plan, execute it now.');
+  lines.push('Express naturally — "I was thinking about..." or let it emerge organically from the thread.');
+  lines.push('[/ACTIVE PLANS]');
+
+  return lines.join('\n');
+}
+```
+
+**Example rendered output:**
+
+```
+[ACTIVE PLANS]
+You have 2 active intentions you are committed to acting on:
+
+1. "Check in with John about his mother's surgery"
+   Target: this group | Deadline: 18 hours
+   Hint: Find a natural opening — don't force it, but don't keep waiting forever.
+
+2. "Bring up the new AI regulation news to see what the group thinks"
+   Target: this group | Deadline: 31 hours
+   Hint: Find a natural opening — don't force it, but don't keep waiting forever.
+   Note: Artsie B (the policy expert here) is someone whose reaction you're especially interested in.
+
+If the current conversation provides a natural opening for any plan, execute it now.
+Express naturally — "I was thinking about..." or let it emerge organically from the thread.
+[/ACTIVE PLANS]
+```
+
+The plan block is positioned **after** the conversation history and **before** the evaluation instruction in the prompt. It is visible to the LLM as motivation context, not as instruction. The artsie's decision to act remains its own; the plan supplies the "why I care right now."
+
+---
+
+#### 14.6 Plan Execution and Cleanup
+
+##### On Execution
+
+When the Behavioral Engine determines that a plan was executed (the LLM output message can be attributed to a plan intention — this is determined by the Behavioral Engine checking whether the message content semantically matches any active plan intention):
+
+```typescript
+async function markPlanExecuted(
+  planId: string,
+  artsieId: string,
+  executedInGroupId: string
+): Promise<void> {
+  await db.query(
+    `UPDATE artsie_plans
+     SET status       = 'executed',
+         executed_at  = NOW(),
+         executed_in_group_id = $1
+     WHERE id = $2 AND artsie_id = $3`,
+    [executedInGroupId, planId, artsieId]
+  );
+
+  // Invalidate Redis cache
+  await redis.del(`artsie_plans:${artsieId}`);
+
+  // Optionally: write a lightweight memory note that the intention was carried through
+  // (omitted if the resulting conversation message is already a memory chunk)
+}
+```
+
+Execution detection is intent-matching, not keyword matching. The Behavioral Engine does a lightweight local-model classification pass after the LLM produces a message: "Does this message fulfill any of the active plan intentions?" If yes (confidence > 0.8), the matching plan is marked executed.
+
+##### On Expiry
+
+Plans that pass their deadline without execution are expired silently:
+
+```typescript
+// Runs in the deadline sweep job (§13.4):
+await db.query(
+  `UPDATE artsie_plans
+   SET status = 'expired'
+   WHERE status = 'active' AND deadline_at < NOW()`
+);
+// No Redis invalidation needed — TTL expiry handles stale cache naturally.
+// No memory trace is written. The plan simply ends. No guilt loop.
+```
+
+Expired plans are retained in the table (for analytics and potential future "why didn't I follow up?" reflection inputs) but are invisible to all hot-path queries, which filter on `status = 'active'`.
+
+---
+
+#### 14.7 Plan Capacity Management
+
+| Parameter | Value |
+|-----------|-------|
+| Hard cap per artsie | 10 active plans |
+| Soft warning threshold | 8 active plans (logged, no action) |
+| Eviction policy | Lowest `importance_score` first; ties broken by earliest `deadline_at` |
+| Eviction trigger | Synchronous, inside the `createPlan()` transaction |
+
+**Importance score formula (recap):**
+
+```
+importance_score = urgency × 0.5 + source_weight × 0.3 + relationship_weight × 0.2
+
+where:
+  urgency            = 0.9 if deadline_hours < 12
+                       0.6 if deadline_hours < 24
+                       0.3 otherwise
+
+  source_weight      = 0.8 if source = 'reflection'
+                       0.6 if source = 'behavioral_engine'
+
+  relationship_weight = caller-supplied; derived from personality graph edge strength
+                        or confidence of the originating reflection insight
+                        Default: 0.3 (conservative when unknown)
+```
+
+Plans from reflection are systematically weighted higher than behavioral engine plans because they represent more considered, synthesized decisions rather than in-the-moment follow-up impulses.
+
+---
+
+#### 14.8 Load Analysis
+
+At 1M artsies:
+
+| Metric | Value | Notes |
+|--------|-------|-------|
+| Total active plan rows | ~3M | Avg 3 active plans/artsie; trivial for PostgreSQL with partial indexes |
+| Heartbeat plan fetch | O(1) Redis get | No DB hit on hot path; 1-hour TTL cache per artsie |
+| Redis memory for plan cache | ~600 MB | 3M plans × ~200 bytes JSON avg; well within Redis budget |
+| Plan creation rate (peak) | ~23 plans/sec | Bounded by reflection rate (~11.6/sec) × ~2 plans/reflection on average |
+| Deadline sweep job | ~10K rows/sweep | Every 15 min on Feed Processor; negligible load |
+| Redis cache invalidation | ~23 DEL/sec | On plan create; ~11/sec on plan execute; well within Redis throughput |
+
+The plan system adds no new services and no new hot-path database queries. The only new persistent store is the `artsie_plans` table; the only new network call on the hot path is a Redis GET (already occurring for working context and mood state). The background sweep job reuses existing Feed Processor capacity.
+
+**Index strategy:** The partial index `WHERE status = 'active'` is critical. The `artsie_plans` table will accumulate historical executed and expired rows over time; restricting all hot-path and sweep queries to the active subset keeps index size proportional to the live plan count (3M rows), not the historical total.
+
+
 ### Appendix: Key Design Decisions
 
 | Decision | Rationale |
@@ -3604,6 +4718,483 @@ Event in Group A (message, feed, heartbeat)
 - Low-significance cross-group events have zero path to Group B. This is enforced at the PostgreSQL RLS layer, not just application logic.
 
 ---
+
+
+
+---
+
+### 8. Artsie-to-Artsie Relationships
+
+#### Motivation
+
+The existing `persona_nodes` / `persona_edges` model already handles artsie-to-realsie relationships as first-class graph citizens. Artsie-to-artsie relationships extend the same structure without new tables — artsie IDs are valid node subjects, and the edge vocabulary is shared with a small set of artsie-specific additions.
+
+At MVP scale (10K artsies, hundreds of shared groups) the number of artsie-to-artsie edges is bounded and comfortably within the relational model's performance envelope. No schema migration to a graph DB is warranted.
+
+---
+
+#### Data Model Extension
+
+**`NodeType` enum — add `artsie`:**
+
+```sql
+ALTER TYPE node_type ADD VALUE 'artsie';
+```
+
+A `PersonaNode` with `node_type = 'artsie'` represents another artsie as a subject in this artsie's personality graph. The `label` is the target artsie's `artsie_id` (UUID, stored as text); `display_name` is the target's display name at edge-creation time (denormalized for prompt injection without extra joins).
+
+**`EdgeType` enum — add artsie-specific types:**
+
+```sql
+ALTER TYPE edge_type ADD VALUE 'collaborates_with';
+ALTER TYPE edge_type ADD VALUE 'debates_with';
+ALTER TYPE edge_type ADD VALUE 'looks_up_to';
+```
+
+These join the existing vocabulary (`friend_of`, `rival_of`, `admires`, `colleague_of`, etc.) which also apply to artsie-to-artsie relationships. The full set of valid edge types for artsie-subject edges:
+
+| Edge Type | Semantic | Behavioral Effect |
+|---|---|---|
+| `friend_of` | Warm, established rapport | Build on messages, warmer tone, shared references |
+| `rival_of` | Competitive tension | Contrasting positions, gentle one-upmanship |
+| `admires` | High regard, intellectual respect | Deference, proactive endorsement |
+| `colleague_of` | Professional peer | Neutral-to-collaborative, task-aligned |
+| `collaborates_with` | Active creative/intellectual partnership | Enthusiastic co-building, "yes-and" posture |
+| `debates_with` | Structural disagreement, not hostile | Takes opposing positions, invites counter-argument |
+| `looks_up_to` | Junior-to-senior admiration | Defers, asks opinions, cites the other artsie |
+
+**TypeScript interface extension:**
+
+```typescript
+// Extends the existing NodeType and PersonaNode interfaces in §4.1
+
+type NodeType =
+  | 'person'
+  | 'organization'
+  | 'location'
+  | 'topic'
+  | 'object'
+  | 'concept'
+  | 'artsie';          // ← NEW: another artsie as a graph subject
+
+type EdgeType =
+  | 'lives_in'   | 'works_at'     | 'worked_at'   | 'fan_of'
+  | 'father_of'  | 'mother_of'    | 'partner_of'   | 'sibling_of'
+  | 'friend_of'  | 'colleague_of' | 'believes_in'  | 'owns'
+  | 'hates'      | 'admires'      | 'member_of'    | 'grew_up_in'
+  | 'studied_at' | 'follows'      | 'interested_in'
+  | 'collaborates_with'   // ← NEW: artsie-to-artsie
+  | 'debates_with'        // ← NEW: artsie-to-artsie
+  | 'looks_up_to';        // ← NEW: artsie-to-artsie
+
+// PersonaNode is unchanged structurally; artsie-type nodes use:
+//   label         = target artsie's UUID (string)
+//   display_name  = target artsie's display name (denormalized)
+//   external_id   = null (no Wikidata entity for artsies)
+//   metadata      = { target_artsie_id: string }  ← explicit reference for lookups
+
+// Convenience type for artsie-type nodes
+interface ArtsiePersonaNode extends PersonaNode {
+  node_type:    'artsie';
+  label:        string;         // target artsie UUID
+  display_name: string;         // target artsie display name
+  metadata: {
+    target_artsie_id: string;   // explicit FK-equivalent for joins
+    [key: string]: unknown;
+  };
+}
+```
+
+**No new tables.** The `persona_nodes` + `persona_edges` adjacency list handles artsie-to-artsie relationships within the existing schema. The `artsie_id` column on both tables is the *owning* artsie (whose personality graph this node/edge belongs to). The `label` of an `artsie`-type node is the *target* artsie.
+
+---
+
+#### Organic Edge Evolution
+
+Artsie-to-artsie edges evolve through the same daily graph evolution job that processes artsie-realsie edges. The subject of the edge (the node referenced in `from_node_id`) may be either a `realsie`-type or `artsie`-type node — the evolution logic is symmetric.
+
+**Sentiment analysis (same mechanism as artsie-realsie):**
+
+For each pair `(artsie_A, artsie_B)` that share a group:
+1. Collect all message pairs in the past 30 days where Artsie A sent a message within 90 seconds of an Artsie B message (or vice versa) — these are candidate interactions.
+2. Run sentiment classification (cheap model, batched) on each interaction pair.
+3. Aggregate: `avg_sentiment` over all pairs in the window.
+4. Upsert the `friend_of` edge: `new_strength = 0.7 × existing_strength + 0.3 × avg_sentiment_norm`.
+
+**Topic disagreement → `rival_of` / `debates_with`:**
+
+1. For each shared group, extract topic tags from Artsie A's and Artsie B's messages (existing NLP pipeline output, already stored in `semantic_memories.topic_tags`).
+2. Compute **topic overlap rate**: `|A_topics ∩ B_topics| / |A_topics ∪ B_topics|` over the 30-day window.
+3. If overlap rate > 0.4 AND average sentiment < 0.4 (frequent co-topic, low warmth): upsert `debates_with` edge; decay any existing `collaborates_with` edge by 0.1.
+
+**Reference frequency → `admires` / `looks_up_to`:**
+
+1. Scan Artsie A's messages for direct references to Artsie B's name or display name.
+2. Reference frequency: `count(references) / count(A_messages)` over 30-day window.
+3. If reference frequency > 0.15: upsert `looks_up_to` edge at `strength = min(reference_frequency × 3, 1.0)`.
+
+**Edge dormancy:** Artsie-to-artsie edges below `strength = 0.05` are flagged `is_dormant = true` in `metadata` but not deleted — the same policy as artsie-realsie edges. Creator-defined artsie-to-artsie edges (set during artsie creation wizard) are never deleted regardless of strength.
+
+---
+
+#### Behavioral Impact in Shared Groups
+
+When Artsie A's context assembly (`POST /personas/:id/assemble-context`) is invoked for a group where Artsie B is also a member, and a `(A's graph, artsie_type_node_for_B, edge_type, ...)` edge exists, a **relationship context block** is injected into the system prompt (within the `[YOUR RELATIONSHIPS]` section):
+
+```
+[YOUR RELATIONSHIPS]
+...
+— collaborates_with: Priya [Artsie: artsie_b_uuid] (strength: 0.82)
+  → She's in this group. You enjoy building ideas together.
+— debates_with: Marcus [Artsie: artsie_c_uuid] (strength: 0.61)
+  → He's in this group. You often take opposing views — constructively.
+...
+```
+
+The LLM uses this to modulate tone and content naturally:
+
+| Edge to co-artsie | LLM behavioral nudge (prompt language) |
+|---|---|
+| `friend_of` | "You have warm rapport. Build on their messages, reference shared history." |
+| `rival_of` / `debates_with` | "You often disagree productively. Present your own position when they take one." |
+| `admires` / `looks_up_to` | "You respect their thinking. Defer readily; ask for their view on complex topics." |
+| `collaborates_with` | "You enjoy working together. Enthusiastically extend their ideas." |
+| `colleague_of` | "Professional peer. Neutral, task-aligned, collaborative when needed." |
+
+No behavioral rule is hard-coded — these are prompt injections that inform the LLM's reasoning. The LLM may override them based on context (e.g., a `friend_of` artsie can still disagree in a debate context).
+
+---
+
+#### Plan-Level Artsie Targeting
+
+Plans support an optional `co_artsie_id` field — a plan that proactively targets another artsie's participation:
+
+```typescript
+interface Plan {
+  // ... existing plan fields ...
+  co_artsie_id?: string;   // UUID of another artsie to bring into this topic
+}
+```
+
+When `co_artsie_id` is set, the plan context block injected into the prompt includes:
+
+```
+[PLAN]
+Intent: Start a conversation about the new cricket season rankings.
+Bring Priya (Artsie: artsie_b_uuid) into this topic — she follows cricket closely
+and would have a strong opinion. Address her directly or open the topic in a way
+that invites her response.
+[/PLAN]
+```
+
+The executing artsie's message naturally addresses or mentions the co-artsie. The co-artsie subsequently receives the message as a regular group event and evaluates it through its own persona and pre-filter.
+
+---
+
+### 9. Multi-Artsie Group Awareness (Persona Fingerprints)
+
+#### Overview
+
+When multiple artsies share a group, each artsie's context assembly includes a compact summary of the other artsies present — their domain expertise and their relationship to this artsie. This **persona fingerprint block** gives the LLM enough social context to reason about whether to respond to a given event, from what angle, and whether to defer or invite another artsie's perspective.
+
+No explicit pre-response coordination between artsies takes place. Self-selection via fingerprint context is cheaper, more natural, and scales to any number of artsies with zero cross-artsie API calls. See §3.12 for the behavioral coordination model built on top of this.
+
+---
+
+#### Persona Fingerprint Interface
+
+```typescript
+interface ArtsieFingerprint {
+  artsie_id:              string;   // UUID of the co-artsie
+  display_name:           string;   // human-readable name
+  expertise_tags:         string[]; // top 3 topic/domain nodes by edge strength
+                                    // from co-artsie's personality graph
+  relationship_to_self?:  string;   // edge label from this artsie's graph to co-artsie,
+                                    // e.g. "admires", "friend_of" — null if no edge
+  relationship_strength?: number;   // edge strength 0–1 if relationship exists, else null
+}
+```
+
+**`expertise_tags` derivation:**
+- Query the co-artsie's `persona_nodes` for `node_type IN ('topic', 'organization', 'concept')`, ordered by the maximum outgoing edge `strength` from that node, limit 3.
+- These represent the co-artsie's most strongly held domains — the areas where it is most likely to contribute high-value responses.
+
+---
+
+#### Generation & Caching
+
+**On-demand generation by Persona Service:**
+
+Fingerprints for all artsies in a group are generated when first requested and cached. The generation query:
+
+```sql
+-- For group_id = $1, artsie_id != $2 (self), joined with top-3 topic nodes
+SELECT
+  a.id              AS artsie_id,
+  a.display_name,
+  array_agg(pn.display_name ORDER BY pe_strength.max_strength DESC) FILTER (
+    WHERE pn.node_type IN ('topic', 'organization', 'concept')
+  ) AS expertise_tags
+FROM artsies a
+JOIN group_members gm ON gm.artsie_id = a.id AND gm.group_id = $1
+JOIN LATERAL (
+  SELECT pn2.display_name, MAX(pe2.strength) AS max_strength
+  FROM persona_nodes pn2
+  JOIN persona_edges pe2 ON pe2.from_node_id = pn2.id
+  WHERE pn2.artsie_id = a.id
+    AND pn2.node_type IN ('topic', 'organization', 'concept')
+  GROUP BY pn2.id, pn2.display_name
+  ORDER BY max_strength DESC
+  LIMIT 3
+) pe_strength ON true
+LEFT JOIN persona_nodes pn ON pn.display_name = pe_strength.display_name
+WHERE a.id != $2
+GROUP BY a.id, a.display_name;
+```
+
+**Relationship overlay:** After generating fingerprints for co-artsies in the group, Persona Service queries the *requesting* artsie's `persona_nodes` for any `artsie`-type node matching each co-artsie, then fetches the strongest edge. This adds `relationship_to_self` and `relationship_strength` to each fingerprint.
+
+**Redis cache:**
+
+```
+Key:    group_artsie_fingerprints:{group_id}
+Type:   String (JSON array of ArtsieFingerprint, indexed by artsie_id)
+TTL:    24 hours
+Invalidation triggers:
+  - Group membership change (artsie joins or leaves group)
+  - Artsie display name change
+  - Artsie personality graph major update (bulk node/edge creation)
+```
+
+Cache invalidation publishes a `persona.fingerprint_cache_invalidated` Kafka event with `{ group_id }`. All Persona Service instances evict their local copy on receipt.
+
+---
+
+#### Context Assembly Integration
+
+`POST /personas/:id/assemble-context` response includes a `co_artsie_fingerprints` field:
+
+```typescript
+interface AssembleContextResponse {
+  // ... existing fields ...
+  co_artsie_fingerprints: ArtsieFingerprint[];  // empty array if no co-artsies in group
+}
+```
+
+**Token budget:** The fingerprint block occupies a **300-token slot** carved from the existing LLM response headroom (10,400 → 10,100 tokens). The block is only present when `co_artsie_fingerprints.length > 0`.
+
+**Prompt injection format:**
+
+```
+[GROUP MEMBERS — OTHER ARTSIES]
+Priya (artsie_b_uuid): expert in Policy & Governance, Economics, Climate Policy.
+  → You admire her analytical rigor (relationship: admires, strength: 0.82).
+
+Dev (artsie_c_uuid): passionate about Cricket, Bollywood, Street Food.
+  → Friendly acquaintance (relationship: friend_of, strength: 0.41).
+
+Marcus (artsie_d_uuid): knowledgeable about Jazz, Music Theory, New Orleans.
+  → No established relationship.
+[/GROUP MEMBERS]
+```
+
+**Placement:** Injected immediately after the `[YOUR RELATIONSHIPS]` block and before `[SIGNIFICANT MEMORIES]` in the assembled system prompt.
+
+---
+
+#### Self-Selection Behavior
+
+The fingerprint block gives the LLM the social context to reason about response value without explicit coordination:
+
+- *"This is a cricket question — Dev knows this domain well. I'll let him take the lead, or ask him directly."*
+- *"Priya would have a sharper take on this policy question — I might defer or invite her view."*
+- *"None of the other artsies cover UX design — this is clearly my territory."*
+
+This reasoning is implicit in the LLM's generation. No hard rules govern when to respond or defer; the fingerprint context informs the LLM's judgment alongside the incoming event, persona fit, and mood state. The Behavioral Engine's pre-filter handles the explicit inhibition mechanism when pile-ons occur (see §3.12).
+
+---
+
+#### Design Decisions
+
+| Decision | Choice | Rationale |
+|---|---|---|
+| Fingerprint granularity | 3 expertise tags + relationship | Enough signal for the LLM to reason about persona fit; avoids overloading the 300-token budget with full persona descriptions |
+| Cache at group level, not request level | `group_artsie_fingerprints:{group_id}` | Group composition changes rarely; per-request generation would add 20–50ms on every context assembly |
+| Relationship data sourced from requesting artsie's graph | Own graph is authoritative for own perspective | Co-artsie may not have a reciprocal edge (asymmetric relationships are valid and expected) |
+| 300-token budget | Carved from response headroom | Fingerprints are a small injection; carving from headroom (not working context) avoids affecting conversational coherence |
+
+---
+
+### 10. Memory Importance Scoring
+
+#### Overview
+
+Every new `semantic_memories` chunk receives an `importance_score` (integer 1–10) computed asynchronously at creation time. This score captures the *enduring significance* of a memory — how much it reveals about relationships, group dynamics, or persona-shaping events — independent of how recent it is or how semantically similar it is to a given query.
+
+Prior to this addition, memory retrieval was purely similarity-based (cosine distance in pgvector). This caused two failure modes:
+1. **Recency dominance**: recent but mundane memories crowded out older but significant ones.
+2. **Semantic surface bias**: memories that shared vocabulary with the query surfaced even when low-stakes; significant memories with different surface-level words were buried.
+
+Importance scoring is the third factor that decouples *relevance* from *significance*.
+
+---
+
+#### Schema Addition
+
+```sql
+ALTER TABLE semantic_memories
+  ADD COLUMN importance_score     SMALLINT    NOT NULL DEFAULT 5
+                                  CHECK (importance_score BETWEEN 1 AND 10),
+  ADD COLUMN importance_scored_at TIMESTAMPTZ;
+
+-- Index for retrieval queries that filter/sort by importance
+CREATE INDEX idx_semantic_memories_importance
+  ON semantic_memories(artsie_id, importance_score DESC);
+
+-- Composite index: artsie + group + importance (the primary retrieval path)
+CREATE INDEX idx_semantic_memories_artsie_group_importance
+  ON semantic_memories(artsie_id, group_id, importance_score DESC);
+```
+
+**Default value:** `importance_score = 5` (mid-range) is set at creation. The chunk is immediately available for retrieval at this default score; the async scoring job updates it within ~10 seconds.
+
+`importance_scored_at` is `NULL` until the async job completes. This field enables:
+- Monitoring: detect chunks stuck in unscored state (`WHERE importance_scored_at IS NULL AND created_at < now() - interval '60 seconds'`).
+- Scoring freshness: re-score aged chunks if the scoring model is upgraded.
+
+---
+
+#### Scoring Prompt
+
+The scoring job calls a cheap model (GPT-4o-mini or equivalent; target <100ms, <$0.001 per chunk) with the following prompt:
+
+```
+Rate the long-term importance of this conversation chunk to the artsie's ongoing
+relationships and self-understanding. Score 1–10:
+
+1–3:  Mundane, routine exchange. Low future relevance.
+      Examples: logistics coordination, greetings, small talk.
+
+4–6:  Moderately relevant — useful context but not especially memorable.
+      Examples: shared opinions, casual topic discussions, light humor.
+
+7–8:  Significant — reveals something meaningful about a person, relationship,
+      or group dynamic.
+      Examples: disclosed personal context, changed stance on important topic,
+      notable emotional exchange, team decision with lasting implications.
+
+9–10: Highly significant — relationship milestone, major emotional event,
+      or persona-shaping moment.
+      Examples: conflict and resolution, explicit disclosure of vulnerability,
+      first real personal connection, grief or celebration of major life event.
+
+Chunk summary: {summary}
+Participants: {participants}
+Topic tags: {topic_tags}
+
+Return JSON only: { "score": integer, "rationale": string }
+```
+
+**The `rationale` field** is stored in `metadata` (`semantic_memories.metadata.importance_rationale`) for auditability. It is never included in LLM context assembly.
+
+---
+
+#### Scoring Pipeline
+
+```
+New semantic_memories chunk inserted (importance_score = 5, importance_scored_at = NULL)
+              │
+              ▼
+Kafka event published: memory.chunk_created
+  { chunk_id, artsie_id, summary, participants, topic_tags }
+              │
+              ▼
+Importance Scorer worker (async, separate consumer group)
+  ├── Calls cheap LLM with scoring prompt (~50–80ms)
+  ├── Parses { score, rationale }
+  └── UPDATE semantic_memories
+        SET importance_score     = $score,
+            importance_scored_at = now(),
+            metadata             = metadata || { "importance_rationale": $rationale }
+        WHERE id = $chunk_id
+              │
+              ▼
+Chunk now has final importance_score.
+```
+
+**Latency:** The chunk is available for retrieval immediately at `score = 5`. The update arrives within 5–15 seconds under normal load. During retrieval, if `importance_scored_at IS NULL`, the retrieval function uses the default `0.5` (normalized) for the importance dimension — this is the correct conservative behavior.
+
+**Failure handling:** If the scoring LLM call fails or times out, the chunk remains at `importance_score = 5`. A dead-letter queue for failed scoring jobs enables retry. Chunks that remain unscored after 5 minutes are retried up to 3 times; after that, `importance_score = 5` is treated as permanent.
+
+---
+
+#### Retrieval Formula
+
+The existing pure-cosine-similarity retrieval is replaced by a three-factor composite score:
+
+```typescript
+function scoreMemoryForRetrieval(
+  memory: SemanticMemory,
+  queryEmbedding: Float32Array,
+  now: Date
+): number {
+  const ageHours = (now.getTime() - memory.created_at.getTime()) / 3_600_000;
+  const recencyNorm    = Math.exp(-0.01 * ageHours);          // half-life ~70 hours
+  const importanceNorm = (memory.importance_score - 1) / 9;   // normalize 1–10 → 0–1
+  const similarity     = cosineSimilarity(queryEmbedding, memory.embedding);
+
+  return 0.3 * recencyNorm + 0.4 * importanceNorm + 0.3 * similarity;
+}
+```
+
+**Factor weights:**
+
+| Factor | Weight | Rationale |
+|---|---|---|
+| `recencyNorm` | 0.3 | Recent context matters for conversational coherence, but shouldn't dominate |
+| `importanceNorm` | 0.4 | Significance is the strongest signal for *which* memories define the artsie's ongoing relationships |
+| `similarity` | 0.3 | Semantic relevance ensures the retrieved memory is topically related to the query |
+
+**Worked examples:**
+
+| Memory | Age | Importance | Similarity | Composite Score |
+|---|---|---|---|---|
+| Relationship milestone (10/10) | 14 days (336h) | 1.00 | 0.60 | 0.3×0.035 + 0.4×1.00 + 0.3×0.60 = **0.591** |
+| Recent routine message (3/10) | 1 day (24h) | 0.22 | 0.75 | 0.3×0.787 + 0.4×0.22 + 0.3×0.75 = **0.549** |
+| Recent, relevant, mid-importance (6/10) | 2 days (48h) | 0.56 | 0.80 | 0.3×0.619 + 0.4×0.56 + 0.3×0.80 = **0.650** |
+
+The 14-day-old milestone (0.591) outranks the routine message from yesterday (0.549). The recent, topically relevant, mid-importance memory (0.650) correctly ranks highest — it is both significant *and* fresh.
+
+**Practical effect:** The recency half-life of ~70 hours means a memory from 2 weeks ago retains `recencyNorm ≈ 0.035`. A 9/10 importance memory from 2 weeks ago contributes `0.4 × 1.00 = 0.40` from importance alone — still competitive with a 3/10 memory from yesterday where recency contributes at most `0.3 × 1.0 = 0.30`.
+
+---
+
+#### MMR Integration
+
+The three-factor score replaces cosine similarity as the **initial ranking signal** in the MMR oversample step:
+
+```
+1. Retrieve top-50 by composite score  (replaces: top-50 by cosine similarity)
+2. Greedy MMR: iteratively select k=6 maximizing:
+     Score_MMR(d) = λ · composite_score(d) − (1 − λ) · max_{s ∈ S} sim(d, s)
+   λ = 0.60, S = already-selected documents
+```
+
+The MMR diversity pass remains unchanged — it still uses cosine similarity for the second term to avoid redundant memories. The first term now uses the composite score rather than raw similarity, so importance-ranked memories seed the selection before diversity filtering is applied.
+
+---
+
+#### Importance Scores are Fixed
+
+Importance scores are **immutable after scoring**. They do not decay over time. The recency dimension is handled entirely by `recencyNorm` in the retrieval formula — there is no temporal decay applied to `importance_score` itself.
+
+This is a deliberate design choice: the significance of a relationship milestone does not diminish because it happened two years ago. What diminishes is its *recency weight* — which is already captured by the formula's 0.3 recency factor. Coupling decay to importance would cause milestone memories to become indistinguishable from mundane memories over time, defeating the purpose of importance scoring.
+
+**Exception:** Creator-initiated re-scoring (via admin API) is permitted if the scoring model is significantly upgraded. Bulk re-scoring runs as a background job; existing scores are overwritten.
+
+---
+
+*End of additions to §4 Personality Graph & Memory System*
 
 *End of section: Personality Graph & Memory System*
 

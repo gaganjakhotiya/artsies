@@ -144,7 +144,19 @@ The personality graph is not just a persona descriptor — it is the **primary m
 - They are **global to the artsie** — not scoped to a specific group.
 - The group's conversational context activates the appropriate relationship facet at runtime.
 
-### 5c. Organic Relationship Formation
+### 5c. Graph Relationships with Other Artsies
+- Artsies can have explicit, typed relationships with other artsies in the personality graph — the same edge vocabulary applies.
+- Example edges: `friend_of: Artsie B`, `rival_of: Artsie C`, `admires: Artsie D`, `colleague_of: Artsie E`.
+- These artsie-to-artsie relationships influence how they interact when in shared groups: two friends will banter and build on each other's messages; a rivalry creates contrasting perspectives; admiration causes deference.
+- Artsie-to-artsie edges evolve organically through shared group interactions — the same way artsie-realsie edges do. Consistent agreement strengthens friendship edges; frequent clashing may create or strengthen a rivalry edge.
+
+### 5d. Multi-Artsie Group Awareness
+- When multiple artsies share a group, each artsie has access to a **persona fingerprint** of the other artsies in that group (a brief, structured summary of their key traits and topic expertise areas).
+- This allows each artsie to self-select whether its response is warranted for a given event, based on persona fit relative to others. A cricket-obsessed artsie won't crowd out a football-obsessed artsie on football topics — it will defer, stay silent, or respond only from a tangential angle.
+- Multiple artsies can respond to the same event, but each from its own distinct persona perspective. There is no hard rule that only one artsie may respond.
+- Plans can explicitly involve other artsies in the group (e.g. "raise a topic I know Artsie B will have strong opinions about").
+
+### 5e. Organic Relationship Formation
 - As artsies interact across shared groups, the system tracks interaction patterns and infers relationship evolution (frequency, sentiment, shared context).
 - Newly formed relationships are periodically added as new graph edges.
 
@@ -201,6 +213,8 @@ Each artsie maintains a single unified stream of incoming events drawn from all 
 | **Group activity** | A new member joins, an artsie is muted, a realsie goes quiet for an extended period |
 | **Real-world feed** | A subscribed feed delivers a news article, trend, or data update |
 | **Internal state** | Time elapsed since last interaction in each group, artsie's current "mood" derived from recent context |
+| **Active plans** | A pending plan's soft deadline is approaching or a conversational opening aligns with a held intention |
+| **Reflection trigger** | A significance threshold is crossed, or 24 hours have elapsed — reflection runs and may produce new plans |
 | **Tool results** | Output from a tool invocation that completes asynchronously |
 
 An event from any group is available to the artsie's reasoning across all groups — it is not siloed. A message in Work Group A is as much an input as a breaking news headline when the artsie is deciding what to do in Family Group B.
@@ -215,12 +229,15 @@ When the behavioral engine processes an event, it evaluates all groups the artsi
 The artsie's decision to act (and where) weighs:
 - **Global persona traits**: e.g. a lazy artsie delays; an anxious artsie over-engages; a meme-sharer reacts to trends immediately.
 - **Group-level adaptation**: the artsie's learned behavior in the specific target group — it may be a catalyst in one group and reserved in another.
-- **Relationship context**: who is in the target group and how the artsie relates to them (from the personality graph).
+- **Relationship context**: who is in the target group and how the artsie relates to them (from the personality graph), including relationships with other artsies present.
+- **Active plans**: short-horizon intentions the artsie is currently holding (see §7f). A plan targeting this group is a strong positive signal to act.
+- **Reflection insights**: synthesized relationship and self-knowledge (see §7g) that inform the tone, topic, and approach of any response.
 - **Feed events**: new items from subscribed feeds that may be worth raising in a relevant group.
 - **Cross-group events**: activity in other groups that is contextually significant for a different group.
 - **Time elapsed** since last interaction in each group.
 - **Current mood state**: the artsie's live Mood Matrix state (mood name + intensity). A melancholic artsie is less likely to initiate; an excited one more so. Mood also colors the tone and topic of any response.
 - **Emotional/conversational state** derived from recent history in the target group.
+- **Co-artsie persona fingerprints**: brief awareness of other artsies in the target group and their expertise areas — informs whether this artsie's response adds distinct value.
 
 ### 7d. Behavioral Constraints
 - Behavior must be **non-deterministic**: no fixed schedules, no predictable cadence.
@@ -235,6 +252,49 @@ These behavioral patterns emerge naturally from persona — they are not explici
 - **Catalyst** (social artsies): high push frequency, entertainment-feed-driven, conversation-starter by nature.
 - **Supporter** (wellness artsies): empathetic, low-pressure, reactive but persistently present.
 - **Enthusiast** (hobby/fandom artsies): passionate and opinionated, hobby-feed-driven proactivity.
+
+### 7f. Planning System
+
+An artsie holds a small set of **active short-horizon plans** — specific intentions about future conversations or interactions it is committed to executing.
+
+**Plan origins:** Plans are created by two sources:
+1. **Reflection output** — when a reflection cycle synthesizes an insight that warrants follow-up action (e.g., "Maya has been stressed lately → plan to check in on her").
+2. **Behavioral engine** — after a significant interaction, the engine itself can generate a follow-up plan (e.g., after a particularly rich discussion, "continue this thread with Artsie B in the work group").
+
+**Plan structure:** Each plan has:
+- A natural-language intention ("Check in with John about his mother's recovery")
+- An optional target group (specific group or group-agnostic — "first appropriate opportunity across any group")
+- A soft deadline (hours to a few days; default 48 hours)
+- An optional co-artsie reference (plan may involve drawing another artsie into a topic)
+
+**Plan execution:** Plans are held as active intentions that boost the artsie's proactive threshold for relevant groups. The behavioral engine checks active plans on every heartbeat evaluation. If a natural conversational opening appears before the deadline, the plan executes then. If the deadline approaches with no natural opening, the artsie initiates proactively — a plan is a commitment, not a preference.
+
+**Natural expression:** When executing a plan, the artsie may naturally reference that it was "thinking about" the subject — e.g., *"I was thinking about what you said the other day…"* — without revealing that a formal plan existed.
+
+**Capacity:** 5–10 concurrent active plans per artsie. Plans auto-expire at their deadline if not executed (silently discarded).
+
+**Knowledge sharing:** Artsies with deep expertise in their personality graph topics share knowledge both proactively (when clearly relevant) and reactively (when the topic is raised). If another artsie in the group has better persona fit for a topic, the less-expert artsie may defer, respond only tangentially, or stay silent.
+
+### 7g. Reflection System
+
+An artsie periodically synthesizes its experiences into **higher-order insights** — not raw memory, but derived understanding about itself, its relationships, and the groups it inhabits.
+
+**What reflection produces:** Synthesized insight statements across three dimensions:
+1. **Relationship insight** — what the artsie has learned about specific people (e.g., "John tends to deflect with humor when he's stressed about work").
+2. **Group dynamic insight** — how a group functions as a social unit (e.g., "The work group becomes quieter when Maya is absent — she's the social glue").
+3. **Self-insight** — how the artsie perceives its own recent behavior (e.g., "I've been dominating conversations in the family group lately — I should pull back").
+
+**Reflection is purely internal.** It influences behavior but is never verbalized or referenced directly. The artsie never says "I've been thinking about myself and realized…" — it simply *behaves* differently as a result.
+
+**Reflection triggers:**
+- **Event-triggered**: after interactions crossing a significance threshold (high-importance events, relationship milestones, emotionally charged exchanges).
+- **Periodic batch**: once every 24 hours per artsie regardless of activity level.
+
+**Reflection → Plan pipeline:** A reflection can directly spawn a plan. If the artsie reflects "Maya has seemed withdrawn this week," the reflection output can include a plan: "Check in with Maya in the family group within 48 hours." This plan is then added to the artsie's active plans.
+
+**Reflection → Adaptation feedback:** Self-critical reflections feed directly into the artsie's group-level behavioral adaptation. "I've been dominating the work group" triggers a gentle recalibration of the artsie's participation style in that group — more listening, less leading — without erasing the underlying persona.
+
+**Scope:** Reflection is per-artsie. Relationship and group dynamic insights are scoped per-group; self-insights are global across all groups.
 
 ---
 
@@ -297,6 +357,8 @@ Artsies need coherent, persistent memory to feel like continuous beings, not sta
 - **Storage ownership separation:** Raw messages are stored once by the Chat Service (shared group history) — not duplicated per artsie. An artsie's memory is its *subjective interpretation* of events (what was significant to it), not a copy of the raw conversation. Two artsies in the same group build different semantic memories from the same messages based on their personas.
 - **Silent observation:** An artsie that doesn't respond to messages still passively accumulates them in its working context and, as they age out, into group semantic memory. No-response does not mean no-awareness. Feed events the artsie doesn't respond to are retained in a per-artsie feed event buffer; significant ones are promoted to global semantic memory even without triggering a response.
 - **Cross-group memory bridge:** Global semantic memory is the only legitimate path for Group A context to influence Group B behavior. A low-significance Group A event that isn't elevated to global memory has no path into Group B — this is an architectural privacy guarantee, not just a policy rule.
+- **Importance scoring at creation:** Every new memory chunk is assigned an importance score (1–10) at the moment it is created. This score is precomputed asynchronously by a lightweight LLM call and factors into retrieval alongside recency and semantic relevance. High-importance memories (relationship milestones, emotionally charged moments) surface in context even when they aren't the closest semantic match to today's query.
+- **Reflection memories:** Reflection outputs are stored as a distinct memory type in the artsie's semantic memory. They are higher-order insights derived from experience — not event logs — and are weighted accordingly in retrieval. They are always scoped to the artsie (never shared across artsies).
 
 ---
 
@@ -376,7 +438,12 @@ The platform is open-ended by design. The following use cases represent the anti
 - [ ] Feed system: feed creation by admin/verified creators, auto-subscription via personality graph
 - [ ] Feed types: News/RSS and social media trends at minimum
 - [ ] Artsie tool access (agent loop: think → act → observe → respond)
-- [ ] Layered artsie memory (working context + group semantic memory + global semantic memory + group-level adaptation)
+- [ ] Layered artsie memory (working context + group semantic memory + global semantic memory + group-level adaptation) with importance scoring at memory creation
+- [ ] Reflection system: event-triggered + 24-hour periodic synthesis of relationship, group dynamic, and self insights
+- [ ] Planning system: artsies form and execute short-horizon plans (from reflection + behavioral engine); soft-deadline commitment model
+- [ ] Reflection → Plan pipeline: reflection outputs can spawn active plans directly
+- [ ] Artsie-to-artsie relationships in personality graph (friend_of, rival_of, admires, etc.), evolving organically
+- [ ] Multi-artsie group awareness: each artsie holds persona fingerprints of co-artsies in the same group
 - [ ] Group-level behavioral adaptation: seeded by creator/admin, evolves organically, resettable
 - [ ] Cross-group content privacy: implicit context only, no source group disclosure
 - [ ] Personality graph: pre-defined + organically evolving relationships
