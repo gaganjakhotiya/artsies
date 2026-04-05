@@ -43,10 +43,11 @@ The goal is to make AI feel like a living presence in human conversations, not a
 
 ## 4. Artsie Persona System
 
-An artsie's persona is a **three-layer model**:
+An artsie's persona is a **four-layer model**:
 1. **Personality graph** — structured, deterministic real-world associations and relationships
 2. **Global free-text description** — nuanced behavioral traits that don't reduce to graph nodes
 3. **Group-level behavioral adaptation** — a per-group layer that shapes how the global persona manifests in each specific group context
+4. **Mood Matrix** — a dynamic, ephemeral emotional state that modulates behavior moment-to-moment
 
 ### 4a. Free-Text Persona Description
 A natural language description capturing traits that don't reduce to graph nodes:
@@ -102,6 +103,30 @@ An artsie's global persona manifests differently across groups based on its rela
 - **Any realsie in a shared group** can give an artsie feedback or corrections mid-conversation (e.g. "you're too aggressive", "talk less about politics").
 - Feedback influences the artsie's group-level behavioral adaptation for that group.
 - The creator's explicit updates always take precedence over organic drift.
+
+### 4g. Mood Matrix
+
+Artsies maintain a live emotional state — the **Mood Matrix** — that fluctuates in response to external signals and internal state. Mood is ephemeral (does not persist permanently, does not write back to the personality graph) and serves as a transient behavioral modifier on top of the stable persona layers.
+
+**Representation:** A named emotional state paired with an intensity scalar (e.g. `contemplative: 0.7`). Named states: `happy`, `excited`, `contemplative`, `melancholic`, `anxious`, `playful`, `tired`, `focused`, `affectionate`, `amused`, `nostalgic`, `restless`, `neutral`.
+
+**Baseline mood:** Each artsie has a personality-defined baseline mood set at creation time that drifts slowly over long timescales. Mood always decays toward this baseline, not toward neutral. A cheerful artsie returns to `happy: 0.6`; a brooding artsie to `melancholic: 0.4`.
+
+**Mood triggers:**
+- **External feed events** — weather at the artsie's location node, breaking news, trending topics matching personality graph associations.
+- **Conversation sentiment** — positive social engagement lifts mood; cold, abrupt, or hostile interactions lower it. Computed in batch from recent message sentiment.
+- **Time of day / circadian rhythm** — each artsie has a configurable daily energy pattern (wake time, peak energy hour, sleep cycle). Mood intensity is modulated by the artsie's position in its circadian cycle.
+
+**Mood decay:** Exponential decay back to personality-defined baseline over hours. A counter-signal (weather clearing, a warm message, a positive feed event) can override the decay immediately.
+
+**Behavioral effects of mood:**
+- **Response frequency** — an excited artsie initiates more; a tired or melancholic artsie initiates less. Mood adjusts the proactive messaging threshold.
+- **Response tone and topic** — a contemplative artsie gravitates toward reflective topics; a playful artsie toward humor and lightness.
+- **Group targeting** — mood influences which groups feel contextually right for a response. A warm, affectionate mood pulls toward intimate groups; a restless mood toward active ones.
+
+**Visibility:** A subtle UI hint — an avatar colour tint and emoji indicator in the group member list — reflects the artsie's current mood. This is aesthetic only; no mood label is ever shown explicitly. The artsie never announces its mood directly — it manifests naturally in language choices.
+
+**Example:** An artsie with a `lives_in: Bengaluru` graph node subscribes to a Bengaluru weather feed. When rain is detected, mood shifts to `contemplative: 0.65` with a 4-hour decay. In its next message: *"oh, it started raining outside... makes me want some hot chai and a good book."*
 
 ---
 
@@ -194,6 +219,7 @@ The artsie's decision to act (and where) weighs:
 - **Feed events**: new items from subscribed feeds that may be worth raising in a relevant group.
 - **Cross-group events**: activity in other groups that is contextually significant for a different group.
 - **Time elapsed** since last interaction in each group.
+- **Current mood state**: the artsie's live Mood Matrix state (mood name + intensity). A melancholic artsie is less likely to initiate; an excited one more so. Mood also colors the tone and topic of any response.
 - **Emotional/conversational state** derived from recent history in the target group.
 
 ### 7d. Behavioral Constraints
@@ -268,6 +294,9 @@ Artsies need coherent, persistent memory to feel like continuous beings, not sta
 - When cross-group event reasoning occurs, global semantic memory and the event group's recent context may also be included — but not the verbatim conversation of the source group.
 - **Public artsie memory is cross-group and persistent** — the artsie builds a unified identity over time across all groups.
 - **Private artsie memory is scoped to its single group.**
+- **Storage ownership separation:** Raw messages are stored once by the Chat Service (shared group history) — not duplicated per artsie. An artsie's memory is its *subjective interpretation* of events (what was significant to it), not a copy of the raw conversation. Two artsies in the same group build different semantic memories from the same messages based on their personas.
+- **Silent observation:** An artsie that doesn't respond to messages still passively accumulates them in its working context and, as they age out, into group semantic memory. No-response does not mean no-awareness. Feed events the artsie doesn't respond to are retained in a per-artsie feed event buffer; significant ones are promoted to global semantic memory even without triggering a response.
+- **Cross-group memory bridge:** Global semantic memory is the only legitimate path for Group A context to influence Group B behavior. A low-significance Group A event that isn't elevated to global memory has no path into Group B — this is an architectural privacy guarantee, not just a policy rule.
 
 ---
 

@@ -3180,6 +3180,26 @@ At inference time, conflicted summaries are passed through unchanged — the sum
 
 ### 6. Memory Architecture
 
+#### Storage Ownership Principle
+
+The memory system separates **objective record** from **subjective interpretation**:
+
+- **Chat Service owns the objective record** — raw messages are stored once in the `messages` table, keyed by `group_id`. This is the shared, canonical conversation log. It is not duplicated per artsie.
+- **Persona Service owns the subjective interpretation** — working context, semantic memories, and global memories are all per-artsie. They represent what *this artsie* found significant, remembered, and internalized. Two artsies in the same group will build completely different semantic memories from the same raw conversation.
+
+**Practical implication:** An artsie's "memory" is not a copy of the chat log — it is a living, persona-colored interpretation of it. This is what makes artsies feel like distinct beings rather than clones with different names.
+
+---
+
+#### Silent Observation
+
+An artsie that does not respond to an event still observes it. Silence is a behavioral output; awareness is always maintained:
+
+- **Group messages**: All messages in a group are written to `working_context:{artsie_id}:{group_id}` regardless of whether the artsie responded. As messages age out of the working context window, they are embedded into group semantic memory. An artsie that was quiet for 50 messages has still "read" all 50.
+- **Feed events**: Feed items are cached in a per-artsie rolling feed buffer (`artsie_feed_buffer:{artsie_id}`, Redis list, last 20 items) regardless of whether the artsie acted on them. This buffer is always available during context assembly. Significant unresponded feed items are additionally promoted to global semantic memory via the feed significance scorer (see below).
+
+---
+
 #### Working Context
 
 **N = 40 messages per group.**
@@ -3301,6 +3321,7 @@ Query embedding: `embed(concat(last_3_working_context_messages, incoming_event_t
 2. **High retrieval reuse**: chunk retrieved ≥ 5 times across different query contexts (cross-group significance signal). Tracked via a `retrieval_count` increment on each retrieval.
 3. **Evolution LLM flags it**: the daily evolution job explicitly identifies a chunk as persona-shaping in its output.
 4. **Creator manually marks** a message or conversation as significant.
+5. **Feed event significance scorer**: feed items in `artsie_feed_buffer` that the artsie did *not* respond to are scored asynchronously after a 30-minute dwell window. If the scorer returns `is_significant: true` (high topic overlap with personality graph, or strong sentiment signal), the feed item is written to global semantic memory directly. This ensures awareness of major events is retained even when no response was generated.
 
 **Milestone detection (cheap pass, runs asynchronously after every chunk is created):**
 
@@ -3333,7 +3354,7 @@ If `is_milestone: true` → `UPDATE semantic_memories SET is_global = true, chun
 | Personality graph summary | 800 | Top 15 nodes/edges, formatted as text | ✅ |
 | Global semantic memories | 1,500 | MMR top-3, `is_global = true` | ✅ (public artsies only) |
 | Group semantic memories | 3,000 | MMR top-6, `group_id = target` | ✅ |
-| Feed event context | 1,500 | Triggering feed item(s) | Only for push events |
+| Feed event context | 1,500 | Recent feed items from `artsie_feed_buffer` (responded + unresponded, rolling last-20 window) | ✅ when feed subscriptions exist |
 | Working context (40 msgs) | 8,000 | Redis `working_context:{artsie_id}:{group_id}` | ✅ |
 | Tool results (agent loop) | 4,000 | Tool invocation outputs | Only when tools used |
 | LLM response headroom | 10,400 | — | — |
@@ -3545,6 +3566,42 @@ async function composeResponse(artsie: Artsie, targetGroupId: string): Promise<s
 ```
 
 The artsie "carries" cross-group influence implicitly — a Group A event that was promoted to global memory (`is_global = true`) may surface in Group B via the global memory retrieval path. This is the designed mechanism: global memories are the only legitimate cross-group channel. Verbatim Group A conversation is structurally unreachable in Group B's context assembly.
+
+#### Cross-Group Context Flow
+
+```
+Event in Group A (message, feed, heartbeat)
+             │
+             ▼
+  Behavioral Engine evaluates for Artsie X
+             │
+      Salience scoring
+             │
+    ┌────────┴────────────┐
+    │ Significant?        │ Not significant
+    │ (milestone, high    │
+    │  salience, etc.)    ▼
+    │             Stays in Group A memory only.
+    │             Structurally unreachable from
+    ▼             Group B at context assembly time.
+  Promoted to Global Semantic Memory
+  (is_global = true, no group_id)
+             │
+             ▼
+  When Artsie X acts in Group B:
+  Context Assembly includes:
+    ✅ Group B working context
+    ✅ Group B semantic memories
+    ✅ Global memories  ◄── only cross-group bridge
+    ✅ Persona + mood
+    ❌ Group A raw messages  (RLS-blocked)
+    ❌ Group A semantic memories  (RLS-blocked)
+```
+
+**What this means in practice:**
+- A casual remark in Group A never leaks to Group B.
+- A significant event in Group A (relationship milestone, major news reaction, emotional disclosure) *may* subtly influence Group B behavior — as implicit personality coloring, never as explicit reference.
+- Low-significance cross-group events have zero path to Group B. This is enforced at the PostgreSQL RLS layer, not just application logic.
 
 ---
 
