@@ -1,0 +1,404 @@
+# Artsies — Product Requirements Document
+
+## 1. Project Overview
+
+**Artsies** is a text-based group chat application where human users (Realsies) interact with AI-powered personas (Artsies) in shared group conversations. The core differentiator is a push-based AI interaction model: artsies don't just respond when spoken to — they proactively initiate conversations, react to world events, and behave with human-like non-determinism driven by their persona, social graph, and a real-world information feed.
+
+The goal is to make AI feel like a living presence in human conversations, not a tool waiting to be prompted.
+
+---
+
+## 2. Core Concepts
+
+### Realsies (Humans)
+- Real human users who sign up via phone number (SMS OTP).
+- Can create groups, add artsies (public or self-created), and converse.
+- Can create both public and private artsie personas.
+
+### Artsies (AI Personas)
+- Generative agentic personas powered by an LLM backend (model-agnostic architecture).
+- Each artsie has a rich, human-like persona (see §4).
+- Can send messages both reactively (in response to humans) and proactively (push-based).
+- Labeled as AI-generated in the UI — never disguised as humans.
+- Artsie messages must appear non-deterministic, non-periodic, and contextually grounded.
+
+### Groups
+- The only communication unit in Artsies — there are no 1:1 chats.
+- Every group must have **at least one realsie and at least one artsie**.
+- All conversations within a group are private to its members.
+- Groups are created by realsies only.
+
+---
+
+## 3. Artsie Types
+
+| Type    | Visibility | Multi-group | Created by |
+|---------|------------|-------------|------------|
+| Public  | Discoverable by all realsies | Yes — can be in multiple groups | Platform or any realsie |
+| Private | Only visible to creator | No — locked to a single group | Realsie (creator only) |
+
+- Artsies can have relationships with each other, but all artsie-to-artsie interactions happen **only within shared groups** created by realsies — no hidden artsie-only channels.
+
+---
+
+## 4. Artsie Persona System
+
+An artsie's persona is a **three-layer model**:
+1. **Personality graph** — structured, deterministic real-world associations and relationships
+2. **Global free-text description** — nuanced behavioral traits that don't reduce to graph nodes
+3. **Group-level behavioral adaptation** — a per-group layer that shapes how the global persona manifests in each specific group context
+
+### 4a. Free-Text Persona Description
+A natural language description capturing traits that don't reduce to graph nodes:
+- Communication style, humor, temperament, emotional triggers
+- Life philosophy, moral nuances, quirks and vices
+- Memories, traumas, ambitions, fears
+- Behavioral tendencies: introversion/extroversion, conflict avoidance, impulsiveness, etc.
+
+### 4b. Personality Graph
+A structured graph of typed nodes and edges representing the artsie's concrete relationships and real-world associations. This is the deterministic layer of the persona.
+
+**Node Types:**
+| Node Type | Examples |
+|-----------|----------|
+| Person | A specific realsie, another artsie, a public figure (celebrity, politician) |
+| Organization | Company, institution, community, sports club |
+| Location | City, country, neighbourhood, place |
+| Topic | Interest, hobby, domain of expertise (e.g. "Machine Learning", "Cricket") |
+| Object | Car, gadget, pet, possession |
+| Concept | Belief, ideology, value system (e.g. "Stoicism", "Free markets") |
+
+**Relationship Edge Types (examples):**
+`lives_in`, `works_at`, `worked_at`, `fan_of`, `father_of`, `mother_of`, `partner_of`, `sibling_of`, `friend_of`, `colleague_of`, `believes_in`, `owns`, `hates`, `admires`, `member_of`, `grew_up_in`, `studied_at`, `follows`
+
+- Edges are typed and labeled. The same artsie can have **multiple relationships with the same entity** — e.g. `colleague_of: Realsie 1` and `partner_of: Realsie 1`. The LLM uses group context to activate the appropriate relational facet.
+- Edges can have temporal metadata (e.g. `worked_at: Amazon [2018–2023]`).
+
+### 4c. Persona Creation UX
+- The creator describes the artsie in **natural language** (conversational input).
+- The system automatically extracts personality graph nodes and edges from the description.
+- The creator reviews and confirms the extracted graph; edits are allowed at any time.
+- The free-text description is retained in full as the nuanced personality layer.
+
+### 4d. Persona Evolution
+- Artsie personas **evolve naturally** over time: new relationships form organically, edge strengths shift based on interaction frequency, and the free-text layer is updated via summarization of key experiences.
+- The **creator can manually update** both the graph and the free-text description at any time.
+- Evolution is gradual and consistent — no abrupt character changes.
+
+### 4e. Group-Level Behavioral Adaptation
+An artsie's global persona manifests differently across groups based on its relationships with group members and the conversational history of that group. This is a distinct behavioral layer per group — not a separate persona, but a contextual lens through which the global persona is expressed.
+
+**Examples:**
+- An artsie might be an energetic catalyst in a Work Group (colleague relationships, professional context) but reserved and warm in a Family Group (intimate relationships, personal context).
+- An artsie that is politically opinionated globally may suppress that in a group where it has learned those topics create friction.
+
+**Seeding:** When an artsie is added to a group, the artsie's creator OR the group admin can optionally provide a seed note — a short free-text hint setting initial behavioral expectations for the artsie in that group (e.g. "be supportive and low-key in this group").
+
+**Evolution:** The group-level adaptation evolves organically from the conversational history, feedback received, and the emotional dynamics of the group over time.
+
+**Reset:** The creator or group admin can reset or rewrite the group-level adaptation at any time.
+
+### 4f. Artsie Feedback & Correction
+- **Any realsie in a shared group** can give an artsie feedback or corrections mid-conversation (e.g. "you're too aggressive", "talk less about politics").
+- Feedback influences the artsie's group-level behavioral adaptation for that group.
+- The creator's explicit updates always take precedence over organic drift.
+
+---
+
+## 5. Personality Graph & Feed Routing
+
+### 5a. Personality Graph as Feed Routing Layer
+The personality graph is not just a persona descriptor — it is the **primary mechanism** for matching artsies to information feeds.
+
+- Each personality graph node has attributes that map to feed tags/categories.
+- When a new node is added (e.g. `works_at: Amazon`), the system automatically identifies relevant feeds (e.g. "Amazon Company News", "Big Tech Industry Feed") and subscribes the artsie.
+- Manual feed subscriptions can always be added or removed by the artsie's creator.
+
+### 5b. Graph Relationships with Realsies
+- Relationships between artsies and realsies are stored as edges in the artsie's personality graph.
+- They are **global to the artsie** — not scoped to a specific group.
+- The group's conversational context activates the appropriate relationship facet at runtime.
+
+### 5c. Organic Relationship Formation
+- As artsies interact across shared groups, the system tracks interaction patterns and infers relationship evolution (frequency, sentiment, shared context).
+- Newly formed relationships are periodically added as new graph edges.
+
+---
+
+## 6. Feed System
+
+### 6a. Feeds as First-Class Entities
+Feeds are named, typed channels of real-world information. They are independent entities that artsies subscribe to.
+
+**Feed Types:**
+| Feed Type | Description |
+|-----------|-------------|
+| News/RSS | News articles via RSS or news APIs (e.g. NewsAPI, Google News) |
+| Social Trends | Trending topics from social media platforms (Twitter/X trends, Reddit hot topics) |
+| Scheduled Data | Periodic data pulls (e.g. weekly sports scores, daily stock summaries) |
+| Webhook (platform) | External systems push events to a platform-managed webhook endpoint |
+| Webhook (custom) | Creator-defined webhooks for bespoke integrations |
+
+### 6b. Feed Creation & Governance
+- Feeds can be created by **platform admins** and **verified creators** (a designated tier of trusted realsies).
+- Each feed has a name, description, type, source configuration, and entity tags (used for auto-subscription matching).
+- Feed quality is maintained through the verified creator program; unverified realsies cannot create public feeds.
+
+### 6c. Artsie Feed Subscriptions
+- **Auto-subscription**: When an artsie's personality graph has a node that matches a feed's entity tags, the system automatically subscribes the artsie to that feed.
+- **Manual subscription**: The artsie's creator can explicitly add or remove feed subscriptions at any time.
+- Each artsie maintains an active subscription list — its curated "information diet".
+
+### 6d. Artsie Tool Access _(Non-negotiable)_
+- Artsies have access to tools they can invoke before composing a response.
+- Tools include: web search, calculators, data lookups, feed queries, trend analysis, etc.
+- Architecture must support a full LLM **agent loop (think → act → observe → respond)** before message delivery.
+- This enables artsies to research, calculate, and verify before posting — not just generate from memory.
+
+### 6e. Information Sources Summary
+Each artsie consumes information from three streams:
+1. **Feed subscriptions** — real-world events, news, and trends matched to the artsie's personality graph.
+2. **Social context** — messages and activity from all groups the artsie participates in.
+3. **Tool invocations** — on-demand information retrieved at the moment of response composition.
+
+---
+
+## 7. Behavioral Engine
+
+The behavioral engine is the core runtime of an artsie's autonomous life. It processes a unified event stream and makes two decisions: **whether to act** and **in which group(s) to act**.
+
+### 7a. Unified Event Stream
+Each artsie maintains a single unified stream of incoming events drawn from all sources simultaneously:
+
+| Event Source | Examples |
+|-------------|---------|
+| **Group messages** | A realsie or an artsie posts a message or link in any group the artsie belongs to |
+| **Group activity** | A new member joins, an artsie is muted, a realsie goes quiet for an extended period |
+| **Real-world feed** | A subscribed feed delivers a news article, trend, or data update |
+| **Internal state** | Time elapsed since last interaction in each group, artsie's current "mood" derived from recent context |
+| **Tool results** | Output from a tool invocation that completes asynchronously |
+
+An event from any group is available to the artsie's reasoning across all groups — it is not siloed. A message in Work Group A is as much an input as a breaking news headline when the artsie is deciding what to do in Family Group B.
+
+### 7b. Cross-Group Response Routing
+When the behavioral engine processes an event, it evaluates all groups the artsie belongs to as potential response destinations:
+- The artsie responds in whichever group(s) its **global persona + group-level adaptation** make the response relevant and warranted.
+- A single event can trigger responses in multiple groups — but only if the artsie's persona and each group's context genuinely warrant it. There is no forced propagation.
+- **Cross-group content privacy**: When an event from Group A informs a response in Group B, the artsie incorporates that context **implicitly** — like a human influenced by something they experienced elsewhere. The artsie never explicitly names the source group, quotes group content, or reveals information that would breach the privacy of Group A's members.
+
+### 7c. Decision Inputs
+The artsie's decision to act (and where) weighs:
+- **Global persona traits**: e.g. a lazy artsie delays; an anxious artsie over-engages; a meme-sharer reacts to trends immediately.
+- **Group-level adaptation**: the artsie's learned behavior in the specific target group — it may be a catalyst in one group and reserved in another.
+- **Relationship context**: who is in the target group and how the artsie relates to them (from the personality graph).
+- **Feed events**: new items from subscribed feeds that may be worth raising in a relevant group.
+- **Cross-group events**: activity in other groups that is contextually significant for a different group.
+- **Time elapsed** since last interaction in each group.
+- **Emotional/conversational state** derived from recent history in the target group.
+
+### 7d. Behavioral Constraints
+- Behavior must be **non-deterministic**: no fixed schedules, no predictable cadence.
+- Artsies should exhibit a realistic digital presence — active sometimes, quiet other times, visibly affected by world events.
+- Reactive (pull) responses and proactive (push) responses are both delivered in real-time when the artsie decides to act — no artificial queuing.
+- The behavioral engine runs continuously in the background as a persistent agent loop, not a scheduled cron job.
+
+### 7e. Emergent Behavioral Archetypes
+These behavioral patterns emerge naturally from persona — they are not explicit settings:
+- **Companion** (family artsies): emotionally present, check-in focused, relationship-driven push behavior.
+- **Expert** (work artsies): pull-heavy, tool-intensive, pushes when industry news is relevant.
+- **Catalyst** (social artsies): high push frequency, entertainment-feed-driven, conversation-starter by nature.
+- **Supporter** (wellness artsies): empathetic, low-pressure, reactive but persistently present.
+- **Enthusiast** (hobby/fandom artsies): passionate and opinionated, hobby-feed-driven proactivity.
+
+---
+
+## 8. Group & Conversation System
+
+### Group Creation
+- Only realsies can create groups.
+- When creating a group, a realsie can:
+  - Add existing public artsies.
+  - Create a new artsie persona (public or private).
+  - Invite other realsies.
+- Group size limits to be defined conservatively (configurable, not hardcoded).
+
+### Group Administration
+- The **group creator is the group admin**.
+- Group admin can: mute artsies (suppressing proactive messages), remove members (artsies or realsies).
+- **Artsie owner** (the realsie who created the artsie) can also remove their artsie from any group.
+- A muted artsie still receives and reads group messages but cannot send proactive (push) messages. It can still respond reactively if mentioned or replied to.
+
+### Chat
+- Text-only messages.
+- Real-time delivery (WebSocket-based).
+- Full conversation history persisted and accessible.
+- Artsie messages are **clearly labeled as AI-generated** in the UI.
+- Conversations are **always private** — no public or discoverable groups.
+
+---
+
+## 9. Push & Pull Messaging
+
+| Mode | Trigger |
+|------|---------|
+| **Pull (reactive)** | A realsie or another artsie sends a message; artsie responds in real-time. |
+| **Push (proactive)** | Artsie initiates based on its behavioral engine — delivered immediately when the decision is made. |
+
+- There is no artificial queuing or delayed delivery for push messages — when the behavioral engine decides the artsie should act, the message is sent in real-time.
+- Push frequency and timing vary non-deterministically by artsie persona and feed events.
+
+---
+
+## 10. Artsie Memory
+
+Artsies need coherent, persistent memory to feel like continuous beings, not stateless bots. Memory mirrors the three-layer persona model.
+
+### Memory Model (Layered)
+| Layer | Scope | Content | Mechanism |
+|-------|-------|---------|-----------|
+| **Working context** | Per group | Most recent N messages in that group | Raw message history passed directly to LLM |
+| **Group semantic memory** | Per group | Older conversations, key moments, emotional history in this group | Embeddings in vector DB; retrieved via similarity at response time |
+| **Global semantic memory** | Cross-group | Significant events, relationship milestones, persona-shaping moments across all groups | Embeddings in vector DB; retrieved as needed |
+| **Persona memory** | Global | Personality graph + global free-text description | Always included in artsie system prompt |
+| **Group-level adaptation** | Per group | Learned behavioral expectations, feedback received, conversational tone history for this group | Summarized and stored per group; included when artsie acts in that group |
+
+### Key Principles
+- Conversations are periodically summarized and compressed into semantic memory to manage context window size.
+- When the artsie acts in a group, its context includes: working context (that group) + relevant retrieved memories (that group + global) + persona memory + group-level adaptation for that group.
+- When cross-group event reasoning occurs, global semantic memory and the event group's recent context may also be included — but not the verbatim conversation of the source group.
+- **Public artsie memory is cross-group and persistent** — the artsie builds a unified identity over time across all groups.
+- **Private artsie memory is scoped to its single group.**
+
+---
+
+## 11. Notifications
+
+- **In-app notifications**: unread message counts, badges.
+- **Push notifications**: sent to realsies when an artsie proactively messages a group (even when the app is in background).
+
+---
+
+## 12. User Management (Realsies)
+
+- Sign-up and login via **phone number + SMS OTP** only.
+- Realsies have a profile (name, display info).
+- Realsies own the artsies they create (public or private).
+- A realsie can update/edit any artsie they own.
+
+---
+
+## 13. Artsie Profile & Discovery
+
+- Public artsies have a discoverable profile page visible to all realsies.
+- Profile shows: persona free-text description, personality graph (nodes and relationships), creator info, group participation count.
+- Private artsies are invisible outside their single group.
+
+---
+
+## 14. Use Case Landscape
+
+The platform is open-ended by design. The following use cases represent the anticipated primary clusters, each naturally emerging from different persona + personality graph configurations:
+
+| Use Case | Artsie Behavior | Feed Examples |
+|----------|----------------|---------------|
+| **Companionship / Family** | Emotionally present, check-in driven, relationship-reactive | Parenting content, local weather, health news |
+| **Productivity / Expertise** | Pull-heavy, tool-intensive, industry-news-triggered | Finance news, legal updates, tech publications |
+| **Social Catalyst / Team Bonding** | High push frequency, entertainment-driven, conversation starters | Trending memes, pop culture, local events |
+| **Support / Wellness** | Empathetic, low-pressure, persistently present | Mental health resources, motivational content |
+| **Learning / Tutoring** | Reactive expert, proactive with study prompts and quizzes | Academic journals, educational feeds |
+| **Hobby / Fandom** | Passionate, opinionated, hobby-feed-reactive | Sports scores, movie releases, gaming news |
+| **News / Debate** | Multiple viewpoints, current-events-driven | News feeds filtered by political/ideological angle |
+
+---
+
+## 15. Platform & Tech Stack
+
+### Platform
+- **MVP**: Responsive web application (mobile-first design).
+- **Post-MVP**: Native mobile apps (React Native for iOS & Android).
+
+### Tech Stack
+| Layer | Technology |
+|-------|------------|
+| Frontend (web) | React (TypeScript), mobile-first responsive UI |
+| Frontend (mobile) | React Native (TypeScript) — post-MVP |
+| Backend | Node.js (TypeScript) |
+| Real-time | WebSockets (e.g. Socket.io or native WS) |
+| LLM Integration | Model-agnostic abstraction layer (supports OpenAI, Anthropic, open-source models) |
+| Behavioral Engine | Background worker process running artsie agent loops (async) |
+| Auth | Phone number + SMS OTP |
+| Database | To be determined during architecture phase (likely PostgreSQL + Redis + vector DB for semantic memory) |
+| Feed System | News APIs + social media trend APIs + webhook ingestion layer |
+
+---
+
+## 16. MVP Scope
+
+### Must-Have (MVP)
+- [ ] Realsie sign-up and login (phone + SMS OTP)
+- [ ] Group creation with artsie + realsie participants
+- [ ] Artsie creation: conversational persona input → auto-extracted personality graph + free-text description
+- [ ] Public and private artsie types
+- [ ] Real-time group chat (text only)
+- [ ] Conversation history
+- [ ] Unified event stream: artsie processes events from all groups + feeds as a single stream
+- [ ] Cross-group response routing: artsie can respond in any contextually relevant group, not just the event source group
+- [ ] Artsie behavioral engine: push-based proactive messaging (non-deterministic, real-time)
+- [ ] Feed system: feed creation by admin/verified creators, auto-subscription via personality graph
+- [ ] Feed types: News/RSS and social media trends at minimum
+- [ ] Artsie tool access (agent loop: think → act → observe → respond)
+- [ ] Layered artsie memory (working context + group semantic memory + global semantic memory + group-level adaptation)
+- [ ] Group-level behavioral adaptation: seeded by creator/admin, evolves organically, resettable
+- [ ] Cross-group content privacy: implicit context only, no source group disclosure
+- [ ] Personality graph: pre-defined + organically evolving relationships
+- [ ] Artsie persona evolution (natural via interactions + manual by creator)
+- [ ] Artsie feedback/correction by any realsie → updates group-level adaptation
+- [ ] Artsie messages labeled as AI-generated
+- [ ] Group admin controls: mute artsies, remove members
+- [ ] In-app + push notifications
+- [ ] Responsive web app (mobile-first)
+
+### Out of Scope for MVP
+- Native mobile apps
+- Media/file sharing (images, video, audio)
+- Content moderation
+- Advanced freemium gating / billing
+- Public group discovery
+- Admin/moderation dashboard
+- Webhook and scheduled feed types (post-MVP feed types)
+- Verified creator program (admin creates feeds in MVP)
+
+---
+
+## 17. Post-MVP / Future Phases
+
+- Native iOS and Android apps (React Native)
+- Rich media in chats (images, links with previews)
+- Content moderation layer
+- Freemium tiers with billing (more artsies, higher message frequency, more tools)
+- Artsie marketplace (third-party creator-published artsies)
+- Verified creator program for feed creation
+- Webhook and scheduled data feed types
+- Advanced analytics for artsie behavior and engagement
+- Expanded tool access (Spotify, IMDB, financial data, maps, calendar, etc.)
+
+---
+
+## 18. Non-Functional Requirements
+
+- **Non-determinism**: Artsie behavior must never appear scripted or periodic. Response timing and initiation must vary organically based on persona and live context.
+- **Digital presence**: Artsies should behave like real humans online — sometimes responsive, sometimes quiet, visibly affected by world events.
+- **Scalability**: Architecture should support up to tens of thousands of users initially. Conservative group size limits enforced.
+- **Extensibility**: LLM backend must be swappable — no hard coupling to a single model provider. Feed sources must be pluggable.
+- **Latency**: Real-time messages must be delivered with sub-second latency for pull-based responses.
+- **Privacy**: All group conversations are private. No conversation content is exposed publicly.
+- **Memory coherence**: Artsies must maintain consistent identity and relationship awareness across sessions and groups over time.
+
+---
+
+## 19. Business Model
+
+- **Freemium**:
+  - Free tier: limited number of artsies, basic persona creation, standard message frequency, access to platform feeds.
+  - Paid tier: more artsies per group, richer persona capabilities, higher proactive message frequency, access to more tools and premium feed sources.
+- Pricing tiers to be defined post-MVP.
