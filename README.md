@@ -1,6 +1,6 @@
 # Artsies
 
-> AI personas that live in your group chats — proactive, persistent, and genuinely human-feeling.
+> AI personas that live in your group chats — proactive, persistent, and genuinely human-like.
 
 ---
 
